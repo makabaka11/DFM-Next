@@ -504,4 +504,4 @@ flutter run
 
 ## License
 
-MIT License — Copyright (c) 2025 NipaPlay
+Apache License 2.0 — Copyright (c) 2026 Retr0
