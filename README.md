@@ -1,6 +1,6 @@
 # DFM-Next (代号 DFM+)
 
-> **预计算布局 + Rust 计算层 + Flutter 渲染层** 的弹幕引擎，从 B 站开源 [DanmakuFlameMaster](https://github.com/Bilibili/DanmakuFlameMaster) 算法 1:1 移植，在 [NipaPlay-Reload](https://github.com/nipaplay/NipaPlay-Reload) 中实验性集成。
+> **预计算布局 + Rust 计算层 + Flutter 渲染层** 的弹幕引擎，从 B 站开源 [DanmakuFlameMaster](https://github.com/Bilibili/DanmakuFlameMaster) 算法 1:1 移植，在 [NipaPlay-Reload](https://github.com/AimesSoft/NipaPlay-Reload) 中实验性集成。
 
 ---
 
@@ -515,7 +515,7 @@ flutter run
 ## 致谢
 
 - [DanmakuFlameMaster](https://github.com/Bilibili/DanmakuFlameMaster) — B 站开源 Android 弹幕引擎，DFM-Next 的算法来源（Apache-2.0 License）
-- [NipaPlay-Reload](https://github.com/nipaplay/NipaPlay-Reload) — DFM-Next 的实验性集成宿主项目
+- [NipaPlay-Reload](https://github.com/AimesSoft/NipaPlay-Reload) — DFM-Next 的实验性集成宿主项目
 
 ## License
 
