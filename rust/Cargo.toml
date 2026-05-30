@@ -12,6 +12,9 @@ categories = ["multimedia", "game-development"]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+rustc-hash = "2"
+smallvec = "1"
+regex = "1"
 
 [dev-dependencies]
 serde_json = "1"

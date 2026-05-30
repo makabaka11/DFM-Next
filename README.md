@@ -27,15 +27,16 @@
 │  │   └─ → DfmPlusPreparedLayout                       │   │
 │  ├────────────────────────────────────────────────────┤   │
 │  │ dfm_plus_layout_frame()  ← 每帧查询 (O(log N))     │   │
-│  │   ├─ lower_bound / upper_bound 二分定位             │   │
-│  │   ├─ X 坐标线性计算                                 │   │
-│  │   ├─ FrameCache LRU 缓存                           │   │
-│  │   └─ → DfmPlusFrameLayout                          │   │
+│  │   ├─ LAYOUT_STORE 句柄查找 (避免序列化整个布局)       │   │
+│  │   ├─ partition_point 二分定位                        │   │
+│  │   ├─ X 坐标线性计算 (预存 is_scroll/centered_x)       │   │
+│  │   ├─ FrameCache O(1) LRU 缓存 (VecDeque)            │   │
+│  │   └─ → DfmPlusFrameLayout (item_index 零 String 分配)│   │
 │  └────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**核心思想：** 原版 DFM 每帧实时遍历 TreeSet 做过滤+碰撞+布局，DFM+ 将全部布局计算前移到 `prepare_layout` 阶段一次性完成，每帧仅需 O(log N) 二分查找 + 线性 X 坐标计算，帧开销极低。
+**核心思想：** 原版 DFM 每帧实时遍历 TreeSet 做过滤+碰撞+布局，DFM+ 将全部布局计算前移到 `prepare_layout` 阶段一次性完成，每帧仅需 O(log N) 二分查找 + 线性 X 坐标计算，帧开销极低。`DfmPlusFrameItem` 仅返回 `item_index + x/y/offstage_x` 四个数值字段，Dart 端通过索引从 `PreparedLayout` 取文本和样式，帧查询阶段零 String 堆分配。`DfmPlusPreparedLayout` 通过不透明句柄（`handle: u64`）存储在 Rust 侧 `LAYOUT_STORE` 中，`dfm_plus_layout_frame` 仅传递句柄而非整个布局数据，避免每帧 MB 级序列化开销。Dart 端时间量化对齐 Rust 帧缓存，相同量化 tick 跳过 FRB 调用。内部使用 FxHashMap（非密码学安全但 2-3x 更快）替代标准库 HashMap，帧缓存淘汰 O(1) 化。
 
 ---
 
@@ -69,7 +70,7 @@ track_count  = floor(effective_height / track_count)
 ```
 
 **滚动弹幕分配策略：**
-1. 压缩过期条目（`compact_scroll_tracks`）
+1. 压缩过期条目（`compact`）
 2. 遍历轨道，用 `scroll_entries_collide()` 检测碰撞
 3. 找到无碰撞轨道则放置
 4. 全部碰撞时执行 **overwrite 策略**：在上方 60% 轨道中找最小右边缘的轨道，清除并替换（模拟原版 `overwriteInsert`）
@@ -82,7 +83,7 @@ track_count  = floor(effective_height / track_count)
 
 ### 2. 碰撞检测 (Collision)
 
-1:1 移植自原版 `DanmakuUtils.willHitInDuration()`：
+1:1 移植自原版 `DanmakuUtils.willHitInDuration()`，优化为直接计算 left/right 的内联函数：
 
 ```
 will_hit_in_duration(d1, d2, view_width):
@@ -91,20 +92,23 @@ will_hit_in_duration(d1, d2, view_width):
   if d2.start - d1.start ≥ d1.duration: return false  // 时间窗口不重叠
 
   // 滚动弹幕：在两个时间点做几何碰撞检测
-  check_at_time(d1, d2, d2.start_time)         // d2 出现时
-  || check_at_time(d1, d2, d1.end_time)        // d1 消失时
+  check_hit_same_type(d1, d2, d2.start_time)   // d2 出现时
+  || check_hit_same_type(d1, d2, d1.end_time)  // d1 消失时
 
-check_at_time:
-  rect1 = get_rect_at(d1, time)
-  rect2 = get_rect_at(d2, time)
-  ScrollRL: hit = rect2.left < rect1.right     // 后者追上前者
-  ScrollLR: hit = rect2.right > rect1.left     // 后者追上前者
+check_hit_same_type:
+  left1 = entry_left_at(d1, time, view_width)
+  right1 = left1 + d1.paint_width
+  left2 = entry_left_at(d2, time, view_width)
+  right2 = left2 + d2.paint_width
+  ScrollRL: hit = left2 < right1              // 后者追上前者
+  ScrollLR: hit = right2 > left1              // 后者追上前者
 ```
 
 **关键改进（相比原版 DFM）：**
 - 每条弹幕有独立的 `step_x`（基于自身长度和时长），碰撞检测精确处理不同速度的弹幕
 - 使用纯函数式时间窗口判定，不依赖当前帧时间，适用于预计算架构
 - 参数顺序自动排序（较早弹幕作为 d1），结果与调用顺序无关
+- 消除了原版三层中间调用链（`check_hit_at_time` → `entry_rect_at` → `check_hit`），改为 `check_hit_same_type` + `entry_left_at` 直接计算，减少函数调用开销
 
 ### 3. 过滤系统 (Filters)
 
@@ -117,7 +121,7 @@ check_at_time:
 | 1 | 类型屏蔽 | 1 | `TypeDanmakuFilter` |
 | 2 | 数量密度 | 2 | `QuantityDanmakuFilter` |
 | 3 | 帧时间保护 | 3 | `ElapsedTimeFilter` |
-| 4 | 关键词屏蔽 | 4 | `KeywordFilter` |
+| 4 | 关键词/正则屏蔽 | 4 | `KeywordRegexFilter` |
 | 5 | 重复合并 | 5 | `DuplicateMergingFilter` |
 
 **次级过滤（`filter_secondary`，碰撞检测后执行）：**
@@ -130,9 +134,15 @@ filter_factor = 1.0 / (max_size + max_size / 5)
 if gap < scroll_duration × filter_factor → 过滤
 ```
 
+**关键词/正则屏蔽（移植自 `KeywordFilter`，扩展正则支持）：**
+- 纯文本关键词：`String::contains()` 匹配
+- 正则表达式：`规则名称/表达式/` 格式，使用 Rust `regex` crate 编译执行
+- 通过 `set_block_words()` 统一设置，自动解析格式并分别存入 `blocked_keywords` 和 `blocked_regexes`
+
 **重复合并算法（移植自 `DuplicateMergingFilter`）：**
 - 10 秒滑动窗口内首次出现 → 放行并记录
 - 同窗口内再次出现 → 加入 blocked 集合，后续全部过滤
+- 惰性清理：仅在 `current_duplicates` 超过 128 条时才执行 `retain`，避免 O(n²) 开销
 
 ### 4. 时长计算与视口缩放 (Factory)
 
@@ -160,17 +170,15 @@ fixed_duration = 3800ms (常量)
 
 GPU 渲染器的描边像素公式：`outline_px = clamp(font_size × 0.06, 1.0, 2.6) × clamp(outline_width, 0.0, 4.0)`
 
-### 6. 三级布局缓存 (Cache)
+### 6. 帧级缓存 (Frame Cache)
 
-受原版 `CacheManagingDrawTask` 三级 Bitmap 缓存启发，DFM+ 实现了布局数据的缓存：
+`layout_frame` 阶段实现了 **帧级 FIFO 缓存**（256 条），以量化时间（1/60s 精度）+ layout cache_key 为键，避免相同时间戳的重复计算。
 
-| 层级 | 缓存键 | 策略 | 容量 |
-|------|--------|------|------|
-| Tier 1 (严格) | FNV-1a(text) + color + font_size + type | 完全命中直接复用 | 2000 条 |
-| Tier 2 (模糊) | 尺寸容差 (±4px 宽, ±2px 高) | 复用 buffer | 500 条 |
-| Tier 3 (未命中) | — | 重新计算 | — |
+**淘汰策略：** 使用 `VecDeque<u64>` 追踪插入顺序，淘汰时 `pop_front` O(1)，替代了原先 O(n) 的 `min_by_key` 全量扫描。
 
-此外，`layout_frame` 阶段实现了 **帧级 LRU 缓存**（256 条），以量化时间（1/60s 精度）+ layout cache_key 为键，避免相同时间戳的重复计算。
+**缓存键采样：** `cache_key` 只采样前 64 条非过滤弹幕 + 可见条目总数，万级弹幕下哈希计算从 O(n) 降为 O(64)。
+
+**内部 HashMap：** 使用 `FxHashMap`（基于 FxHash，非密码学安全但 2-3x 更快）替代标准库 `HashMap`（SipHash-2-4）。
 
 ### 7. 自适应帧率计时器 (Timer)
 
@@ -219,18 +227,16 @@ DFM-Next/
 │       ├── lib.rs                     # crate 入口 (pub mod dfm_core, api)
 │       ├── dfm_core/                  # 核心算法模块
 │       │   ├── mod.rs
-│       │   ├── model.rs               # DanmakuItem, Duration, GlobalFlags, DanmakuType
-│       │   ├── retainer.rs            # DanmakuRetainer — 轨道碰撞避让引擎
-│       │   ├── collision.rs           # will_hit_in_duration() — 碰撞检测
-│       │   ├── filters.rs             # FilterSystem — 两级过滤管线
+│       │   ├── model.rs               # DanmakuItem, Duration, GlobalFlags, EpochFlags, DanmakuType
+│       │   ├── retainer.rs            # DanmakuRetainer — 轨道碰撞避让引擎 (SmallVec)
+│       │   ├── filters.rs             # FilterSystem — 两级过滤管线 (FxHashMap + 惰性清理)
 │       │   ├── types.rs               # X 位置计算 (R2L/L2R/固定/特殊路径)
 │       │   ├── factory.rs             # 时长计算 / 视口缩放 / 描边像素
-│       │   ├── measure.rs             # 启发式字体度量 + HeuristicMeasurer
-│       │   ├── cache.rs               # 三级布局缓存 + FNV-1a
+│       │   ├── measure.rs             # 启发式字体度量 + HeuristicMeasurer（无锁）
 │       │   └── timer.rs               # AdaptiveTimer — 自适应帧率计时器
 │       └── api/
 │           ├── mod.rs
-│           └── dfm_plus.rs            # 公共 API + 帧缓存 + 二分查找
+│           └── dfm_plus.rs            # 公共 API + 帧缓存 (FxHashMap + VecDeque O(1) LRU) + partition_point
 │
 ├── flutter/                           # Flutter 渲染层
 │   ├── pubspec.yaml
@@ -262,7 +268,7 @@ DFM-Next/
 
 | 算法模块 | 原版 DFM | DFM-Next | 差异说明 |
 |---------|---------|----------|---------|
-| **碰撞检测** | `DanmakuUtils.willHitInDuration()` 两点矩形重叠 | 1:1 移植，独立 `step_x` 精确处理速度差异 | 原版所有弹幕共享 speed_factor，DFM-Next 每条弹幕独立计算 |
+| **碰撞检测** | `DanmakuUtils.willHitInDuration()` 两点矩形重叠 | 1:1 移植 + 内联优化，独立 `step_x` 精确处理速度差异 | 原版所有弹幕共享 speed_factor，DFM-Next 每条弹幕独立计算；消除了三层中间调用链 |
 | **轨道分配** | `DanmakusRetainer` 按 Y 排序遍历 + overwrite | 1:1 移植，按类型独立轨道数组 + overwrite 策略 | 结构化为显式轨道数组，避免线性扫描 |
 | **过滤系统** | 10 种运行时过滤器，渲染循环中实时执行 | 移植 5 种核心过滤器，布局阶段一次执行 | 移植了 Type/Quantity/ElapsedTime/Keyword/Duplicate |
 | **时长计算** | `DanmakuFactory.updateViewportState()` | 1:1 移植，相同公式和常量 | 完全一致 |
@@ -277,7 +283,7 @@ DFM-Next/
 | 单帧布局复杂度 | O(N × M) 遍历所有可见弹幕 × 轨道 | O(log N) 二分查找 + O(K) 可见弹幕 |
 | 碰撞检测调用 | 每帧每条弹幕对每条轨道 | 仅 prepare 阶段一次 |
 | 内存分配 | 每帧创建临时对象 (Rect, Paint) | prepare 阶段分配，帧查询零分配 |
-| 缓存 | 三级 Bitmap 缓存 + 对象池 | 三级布局缓存 + 帧级 LRU |
+| 缓存 | 三级 Bitmap 缓存 + 对象池 | 帧级 FIFO 缓存 (O(1) 淘汰) + FxHashMap |
 | 渲染 | CPU Canvas (受弹幕密度限制) | GPU 并行 (高密度下优势明显) |
 
 ### 功能对比
@@ -294,7 +300,7 @@ DFM-Next/
 | 重复合并 | ✅ `DuplicateMergingFilter` | ✅ 移植 |
 | 最大行数限制 | ✅ `MaximumLinesFilter` | ✅ 移植 |
 | 重叠检测 | ✅ `OverlappingFilter` | ✅ 移植 |
-| 关键词过滤 | ✅ | ✅ 移植 |
+| 关键词过滤 | ✅ | ✅ 移植 + 正则扩展 |
 | 类型过滤 | ✅ | ✅ 移植 |
 | 优先级系统 | ✅ priority > 0 跳过过滤 | 🔲 (模型字段已预留) |
 | 用户 ID 过滤 | ✅ `UserFilter` | 🔲 |
@@ -351,12 +357,13 @@ let layout = dfm_plus_prepare_layout(request)?;
 
 // 逐帧位置查询（O(log N) 二分查找 + X 坐标计算）
 let frame = dfm_plus_layout_frame(DfmPlusFrameRequest {
-    layout,
+    layout_handle: layout.handle,
     current_time_seconds: 6.0,
 });
 
-for item in &frame.items {
-    println!("[{}] x={:.1} y={:.1}", item.text, item.x, item.y);
+for fi in &frame.items {
+    let pi = &layout.items[fi.item_index as usize];
+    println!("[{}] x={:.1} y={:.1}", pi.text, fi.x, fi.y);
 }
 ```
 
@@ -449,8 +456,8 @@ DfmPlusOverlay(
       ▼
 3. 每帧: DfmPlusLayoutBridge.layout(currentTimeSeconds)
    └─ dfm_plus_layout_frame()
-       ├─ FrameCache LRU 命中检查
-       ├─ lower_bound / upper_bound → 可见弹幕范围
+       ├─ FrameCache FIFO 命中检查 (O(1) 淘汰)
+       ├─ partition_point → 可见弹幕范围
        ├─ 线性计算 X 坐标
        └─ → List<DfmPlusFrameItem>
       │
@@ -467,12 +474,20 @@ DfmPlusOverlay(
 | 特性 | 说明 |
 |------|------|
 | **预计算架构** | `prepare_layout` 一次性完成全部碰撞检测和轨道分配，`layout_frame` 仅做二分查找 + X 坐标计算 |
-| **O(log N) 帧查询** | 按时间排序的 `item_times` 数组 + 自实现 `lower_bound` / `upper_bound` |
-| **帧级 LRU 缓存** | 256 条容量，量化时间键（1/60s 精度），相同时间戳直接命中 |
-| **布局缓存** | 三级缓存（严格 FNV-1a / 模糊尺寸 / 未命中），避免重复度量计算 |
+| **O(log N) 帧查询** | 按时间排序的 `item_times` 数组 + 标准库 `partition_point` 二分查找 |
+| **帧级 FIFO 缓存** | 256 条容量，量化时间键（1/60s 精度），O(1) 淘汰（VecDeque），相同时间戳直接命中 |
+| **FxHashMap** | 全局替换标准库 HashMap/HashSet，非密码学安全但 2-3x 更快 |
+| **SmallVec** | overwrite 路径 `SmallVec<[usize; 4]>` 替代 `Vec<usize>`，少量 displaced 时零堆分配 |
+| **惰性清理** | `filter_duplicate` 的 `retain` 仅在 HashMap 超过 128 条时执行，消除 O(n²) |
+| **帧查询零分配** | `DfmPlusFrameItem` 仅含 `item_index + x/y/offstage_x`，无 String clone，通过索引从 PreparedLayout 取样式 |
+| **不透明句柄** | `DfmPlusPreparedLayout.handle` + Rust 侧 `LAYOUT_STORE`，帧查询仅传递 8 字节句柄，避免每帧 MB 级布局序列化 |
+| **Dart 时间量化** | `(time × 60).round()` 对齐 Rust 帧缓存量化，相同 tick 跳过 `layout()` FRB 调用 |
+| **预存计算** | `is_scroll` + `centered_x` 预计算，帧查询消除 type match 和重复除法 |
+| **EpochFlags** | 6 个 epoch flag 合并为结构体，方便后续冷热数据拆分 |
+| **正则过滤** | `规则名称/表达式/` 格式自动解析为 `regex::Regex`，纯文本关键词走 `contains()` 快速路径 |
 | **增量更新** | Bridge 层 8 项参数变化检测，仅必要时重新调用 `prepare_layout` |
-| **轨道压缩** | `compact_scroll_tracks` 在每次放置前清除过期条目 |
-| **零运行时依赖** | Rust crate 无任何第三方依赖（dev-dependencies 除外） |
+| **轨道压缩** | `compact` 在每次放置前清除过期条目 |
+| **轻量依赖** | Rust crate 仅依赖 `rustc-hash` + `smallvec` + `regex`（dev-dependencies 除外） |
 
 ---
 
@@ -504,4 +519,4 @@ flutter run
 
 ## License
 
-MIT License — Copyright (c) 2025 NipaPlay
+Apache License 2.0 — Copyright (c) 2026 Retr0

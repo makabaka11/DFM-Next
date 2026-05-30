@@ -1,16 +1,9 @@
-/// Track-based collision avoidance layout engine.
-/// Inspired by Next2's track + compaction approach for correct pre-computed layout.
-///
-/// Key design: per-type track arrays storing lightweight collision records,
-/// compact expired items before each placement, assign to first non-colliding track,
-/// compute Y from track index.
+use smallvec::SmallVec;
 
 use crate::dfm_core::model::{DanmakuItem, DanmakuType, GlobalFlags};
 
-/// Lightweight record stored in tracks for collision detection.
-/// Avoids needing to look up items by index from an external array.
-/// For fixed danmaku, `time_ms` is used as the track's END time (not start time),
-/// so that Pass 1 can correctly check if a new danmaku starts after the track is free.
+type DisplacedIndices = SmallVec<[usize; 4]>;
+
 #[derive(Debug, Clone)]
 struct TrackEntry {
     time_ms: i64,
@@ -38,13 +31,44 @@ impl TrackEntry {
     }
 }
 
-/// Track-based collision avoidance engine.
+#[derive(Debug, Clone)]
+struct TrackData {
+    tracks: Vec<Vec<TrackEntry>>,
+}
+
+impl TrackData {
+    fn new() -> Self {
+        Self {
+            tracks: Vec::new(),
+        }
+    }
+
+    fn ensure_track_count(&mut self, count: usize) {
+        if self.tracks.len() != count {
+            self.tracks.resize_with(count, Vec::new);
+        }
+    }
+
+    fn compact(&mut self, current_time_ms: i64, current_duration_ms: i64) {
+        for track in self.tracks.iter_mut() {
+            track.retain(|existing| {
+                current_time_ms < existing.end_ms() + current_duration_ms
+                    && current_time_ms > existing.time_ms - existing.duration_ms
+            });
+        }
+    }
+
+    fn clear(&mut self) {
+        self.tracks.clear();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DanmakuRetainer {
-    r2l_tracks: Vec<Vec<TrackEntry>>,
-    lr_tracks: Vec<Vec<TrackEntry>>,
-    top_tracks: Vec<Vec<TrackEntry>>,
-    bottom_tracks: Vec<Vec<TrackEntry>>,
+    r2l_tracks: TrackData,
+    lr_tracks: TrackData,
+    top_tracks: TrackData,
+    bottom_tracks: TrackData,
     margin: f32,
     track_gap_ratio: f32,
 }
@@ -52,10 +76,10 @@ pub struct DanmakuRetainer {
 impl DanmakuRetainer {
     pub fn new(margin: f32, track_gap_ratio: f32) -> Self {
         Self {
-            r2l_tracks: Vec::new(),
-            lr_tracks: Vec::new(),
-            top_tracks: Vec::new(),
-            bottom_tracks: Vec::new(),
+            r2l_tracks: TrackData::new(),
+            lr_tracks: TrackData::new(),
+            top_tracks: TrackData::new(),
+            bottom_tracks: TrackData::new(),
             margin,
             track_gap_ratio,
         }
@@ -68,9 +92,6 @@ impl DanmakuRetainer {
         self.bottom_tracks.clear();
     }
 
-    /// Assign a Y position to a danmaku item using track-based collision avoidance.
-    /// Returns true if a position was found, false if the item should be dropped.
-    /// Returns indices of any displaced danmaku that should be marked as filtered.
     pub fn fix(
         &mut self,
         item: &mut DanmakuItem,
@@ -79,7 +100,7 @@ impl DanmakuRetainer {
         flags: &GlobalFlags,
         display_area: f32,
         is_me: bool,
-    ) -> (bool, Vec<usize>) {
+    ) -> (bool, DisplacedIndices) {
         let capped_display = if item.danmaku_type.is_scroll() {
             display_area.min(0.75)
         } else {
@@ -97,126 +118,94 @@ impl DanmakuRetainer {
 
         match item.danmaku_type {
             DanmakuType::ScrollRL => {
-                if self.r2l_tracks.len() != track_count {
-                    self.r2l_tracks.resize_with(track_count, Vec::new);
-                }
+                self.r2l_tracks.ensure_track_count(track_count);
                 match select_scroll_track(&entry, &mut self.r2l_tracks, track_count, view_width, is_me) {
                     Some((row, displaced)) => {
                         item.y = self.margin + row as f32 * track_height;
                         item.is_shown = true;
-                        item.visible_flag = flags.visible_flag;
+                        item.flags.visible = flags.visible_flag;
                         (true, displaced)
                     }
-                    None => (false, Vec::new()),
+                    None => (false, SmallVec::new()),
                 }
             }
             DanmakuType::ScrollLR => {
-                if self.lr_tracks.len() != track_count {
-                    self.lr_tracks.resize_with(track_count, Vec::new);
-                }
+                self.lr_tracks.ensure_track_count(track_count);
                 match select_scroll_track(&entry, &mut self.lr_tracks, track_count, view_width, is_me) {
                     Some((row, displaced)) => {
                         item.y = self.margin + row as f32 * track_height;
                         item.is_shown = true;
-                        item.visible_flag = flags.visible_flag;
+                        item.flags.visible = flags.visible_flag;
                         (true, displaced)
                     }
-                    None => (false, Vec::new()),
+                    None => (false, SmallVec::new()),
                 }
             }
             DanmakuType::FixTop => {
-                if self.top_tracks.len() != track_count {
-                    self.top_tracks.resize_with(track_count, Vec::new);
-                }
-                match select_fixed_track(&entry, &mut self.top_tracks, track_count) {
+                self.top_tracks.ensure_track_count(track_count);
+                match select_fixed_track(&entry, &mut self.top_tracks.tracks, track_count) {
                     Some((row, was_queued, displaced_index)) => {
                         if was_queued {
-                            let last = self.top_tracks[row].last().unwrap();
+                            let last = self.top_tracks.tracks[row].last().unwrap();
                             item.time_ms = last.time_ms;
                         }
                         item.y = self.margin + row as f32 * track_height;
                         item.is_shown = true;
-                        item.visible_flag = flags.visible_flag;
+                        item.flags.visible = flags.visible_flag;
                         (true, displaced_index.into_iter().collect())
                     }
-                    None => (false, Vec::new()),
+                    None => (false, SmallVec::new()),
                 }
             }
             DanmakuType::FixBottom => {
-                if self.bottom_tracks.len() != track_count {
-                    self.bottom_tracks.resize_with(track_count, Vec::new);
-                }
-                match select_fixed_track(&entry, &mut self.bottom_tracks, track_count) {
+                self.bottom_tracks.ensure_track_count(track_count);
+                match select_fixed_track(&entry, &mut self.bottom_tracks.tracks, track_count) {
                     Some((row, was_queued, displaced_index)) => {
                         if was_queued {
-                            let last = self.bottom_tracks[row].last().unwrap();
+                            let last = self.bottom_tracks.tracks[row].last().unwrap();
                             item.time_ms = last.time_ms;
                         }
                         item.y = effective_height - (row as f32 + 1.0) * track_height;
                         item.is_shown = true;
-                        item.visible_flag = flags.visible_flag;
+                        item.flags.visible = flags.visible_flag;
                         (true, displaced_index.into_iter().collect())
                     }
-                    None => (false, Vec::new()),
+                    None => (false, SmallVec::new()),
                 }
             }
             DanmakuType::Special => {
                 item.y = 0.0;
                 item.is_shown = true;
-                item.visible_flag = flags.visible_flag;
-                (true, Vec::new())
+                item.flags.visible = flags.visible_flag;
+                (true, SmallVec::new())
             }
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Track selection
-// ---------------------------------------------------------------------------
-
-/// Compact expired scroll entries from tracks.
-fn compact_scroll_tracks(
-    current_time_ms: i64,
-    tracks: &mut [Vec<TrackEntry>],
-    current_duration_ms: i64,
-) {
-    for track in tracks.iter_mut() {
-        track.retain(|existing| {
-            current_time_ms < existing.end_ms() + current_duration_ms
-                && current_time_ms > existing.time_ms - existing.duration_ms
-        });
-    }
-}
-
-/// Select a track for a scroll danmaku.
-/// Returns (track_index, displaced_indices) or None if the item should be dropped.
-/// When all tracks collide, uses DFM's overwriteInsert strategy: pick the track
-/// whose items have the smallest right edge (furthest left), clear it, and place
-/// the new danmaku there. Returns indices of all cleared entries so the caller
-/// can mark them as filtered.
 fn select_scroll_track(
     new_entry: &TrackEntry,
-    tracks: &mut [Vec<TrackEntry>],
+    track_data: &mut TrackData,
     track_count: usize,
     view_width: f32,
     is_me: bool,
-) -> Option<(usize, Vec<usize>)> {
-    compact_scroll_tracks(new_entry.time_ms, tracks, new_entry.duration_ms);
+) -> Option<(usize, DisplacedIndices)> {
+    track_data.compact(new_entry.time_ms, new_entry.duration_ms);
 
     for i in 0..track_count {
-        let collides = tracks[i].iter().any(|existing| {
+        let collides = track_data.tracks[i].iter().any(|existing| {
             scroll_entries_collide(new_entry, existing, view_width)
         });
         if !collides {
-            tracks[i].push(new_entry.clone());
-            return Some((i, Vec::new()));
+            track_data.tracks[i].push(new_entry.clone());
+            return Some((i, SmallVec::new()));
         }
     }
 
     if is_me && track_count > 0 {
-        let displaced: Vec<usize> = tracks[0].iter().map(|e| e.danmaku_index).collect();
-        tracks[0].clear();
-        tracks[0].push(new_entry.clone());
+        let displaced: DisplacedIndices = track_data.tracks[0].iter().map(|e| e.danmaku_index).collect();
+        track_data.tracks[0].clear();
+        track_data.tracks[0].push(new_entry.clone());
         return Some((0, displaced));
     }
 
@@ -225,7 +214,7 @@ fn select_scroll_track(
     let mut best_track = 0;
     let mut min_right_edge = f32::MAX;
     for i in 0..upper_limit {
-        for entry in &tracks[i] {
+        for entry in &track_data.tracks[i] {
             let right_edge = entry_right_edge_at(entry, new_entry.time_ms, view_width);
             if right_edge < min_right_edge {
                 min_right_edge = right_edge;
@@ -235,9 +224,9 @@ fn select_scroll_track(
     }
 
     if min_right_edge < f32::MAX {
-        let displaced: Vec<usize> = tracks[best_track].iter().map(|e| e.danmaku_index).collect();
-        tracks[best_track].clear();
-        tracks[best_track].push(new_entry.clone());
+        let displaced: DisplacedIndices = track_data.tracks[best_track].iter().map(|e| e.danmaku_index).collect();
+        track_data.tracks[best_track].clear();
+        track_data.tracks[best_track].push(new_entry.clone());
         return Some((best_track, displaced));
     }
 
@@ -254,7 +243,7 @@ fn select_fixed_track(
     track_count: usize,
 ) -> Option<(usize, bool, Option<usize>)> {
     let new_start = new_entry.time_ms;
-    
+
     for i in 0..track_count {
         if tracks[i].is_empty() {
             tracks[i].push(new_entry.clone());
@@ -267,7 +256,7 @@ fn select_fixed_track(
             return Some((i, false, None));
         }
     }
-    
+
     let mut best_track = 0;
     let mut earliest_end = i64::MAX;
     for i in 0..track_count {
@@ -293,14 +282,9 @@ fn select_fixed_track(
     Some((best_track, true, Some(displaced_index)))
 }
 
-// ---------------------------------------------------------------------------
-// Collision detection (ported from DanmakuFlameMaster's DanmakuUtils)
-// ---------------------------------------------------------------------------
-
-/// Check if two scroll entries will collide (1:1 port from DFM)
-/// Ported from DanmakuUtils.willHitInDuration()
+#[inline]
 fn scroll_entries_collide(entry_a: &TrackEntry, entry_b: &TrackEntry, view_width: f32) -> bool {
-    if entry_a.danmaku_type != entry_b.danmaku_type {
+    if !check_hit_same_type(entry_a.danmaku_type, entry_b.danmaku_type) {
         return false;
     }
 
@@ -311,94 +295,91 @@ fn scroll_entries_collide(entry_a: &TrackEntry, entry_b: &TrackEntry, view_width
     };
 
     let d_time = d2.time_ms - d1.time_ms;
-    
+
     if d_time <= 0 {
         return true;
     }
-    
+
     if d_time >= d1.duration_ms as i64 {
         return false;
     }
 
-    let d2_start = d2.time_ms;
+    let d2_left = entry_left_at_start(d2, view_width);
+    let d1_right_at_d2_start = entry_left_at(d1, d2.time_ms, view_width) + d1.paint_width;
+
+    if d2.danmaku_type == DanmakuType::ScrollRL {
+        if d2_left < d1_right_at_d2_start {
+            return true;
+        }
+    } else {
+        let d2_right_at_d2_start = d2_left + d2.paint_width;
+        let d1_left_at_d2_start = entry_left_at(d1, d2.time_ms, view_width);
+        if d2_right_at_d2_start > d1_left_at_d2_start {
+            return true;
+        }
+    }
+
     let d1_end = d1.end_ms();
-    
-    check_hit_at_time(d1, d2, d2_start, view_width)
-        || check_hit_at_time(d1, d2, d1_end, view_width)
-}
+    if d1_end > d2.time_ms {
+        let d1_right_at_end = entry_left_at(d1, d1_end, view_width) + d1.paint_width;
+        let d2_left_at_end = entry_left_at(d2, d1_end, view_width);
 
-/// Check collision at a specific time (port from DanmakuUtils.checkHitAtTime)
-/// Parameter order matches DFM original: d1=earlier/existing, d2=later/new
-fn check_hit_at_time(
-    d1: &TrackEntry,
-    d2: &TrackEntry,
-    time_ms: i64,
-    view_width: f32,
-) -> bool {
-    let rect1 = entry_rect_at(d1, time_ms, view_width);
-    let rect2 = entry_rect_at(d2, time_ms, view_width);
-    check_hit(d1.danmaku_type, d2.danmaku_type, rect1, rect2)
-}
-
-/// Get entry's bounding rectangle at a specific time
-fn entry_rect_at(
-    entry: &TrackEntry,
-    time_ms: i64,
-    view_width: f32,
-) -> (f32, f32, f32, f32) {
-    let left = entry_left_at(entry, time_ms, view_width);
-    (left, 0.0, left + entry.paint_width, 0.0)
-}
-
-/// Perform actual hit check based on type (port from DanmakuUtils.checkHit)
-fn check_hit(
-    type1: DanmakuType,
-    type2: DanmakuType,
-    rect1: (f32, f32, f32, f32),
-    rect2: (f32, f32, f32, f32),
-) -> bool {
-    if type1 != type2 {
-        return false;
+        if d2.danmaku_type == DanmakuType::ScrollRL {
+            if d2_left_at_end < d1_right_at_end {
+                return true;
+            }
+        } else {
+            let d2_right_at_end = d2_left_at_end + d2.paint_width;
+            let d1_left_at_end = entry_left_at(d1, d1_end, view_width);
+            if d2_right_at_end > d1_left_at_end {
+                return true;
+            }
+        }
     }
-    
-    match type1 {
-        DanmakuType::ScrollRL => {
-            // For RL: hit if left2 < right1
-            rect2.0 < rect1.2
-        }
-        DanmakuType::ScrollLR => {
-            // For LR: hit if right2 > left1
-            rect2.2 > rect1.0
-        }
-        _ => false,
+
+    false
+}
+
+#[inline]
+fn check_hit_same_type(type1: DanmakuType, type2: DanmakuType) -> bool {
+    type1 == type2 && (type1 == DanmakuType::ScrollRL || type1 == DanmakuType::ScrollLR)
+}
+
+#[inline]
+fn entry_left_at_start(entry: &TrackEntry, view_width: f32) -> f32 {
+    if entry.danmaku_type == DanmakuType::ScrollLR {
+        -entry.paint_width
+    } else {
+        view_width
     }
 }
 
-/// Get the left edge (x position) of a scroll entry at a given time.
-/// Handles entries that start in the future or have ended.
+#[inline]
 fn entry_left_at(entry: &TrackEntry, time_ms: i64, view_width: f32) -> f32 {
     if entry.danmaku_type == DanmakuType::ScrollLR {
         return entry_x_at(entry, time_ms, view_width);
     }
-    
+
     let elapsed = (time_ms - entry.time_ms).max(0) as f32;
-    
+
     if entry.step_x <= 0.0 {
         return view_width;
     }
-    
+
     if elapsed >= entry.duration_ms as f32 {
         return -entry.paint_width;
     }
-    
+
     let pos = view_width - elapsed * entry.step_x;
     pos.max(-entry.paint_width)
 }
 
+#[inline]
 fn entry_right_at(entry: &TrackEntry, time_ms: i64, view_width: f32) -> f32 {
     entry_left_at(entry, time_ms, view_width) + entry.paint_width
 }
 
+#[inline]
 fn entry_x_at(entry: &TrackEntry, time_ms: i64, view_width: f32) -> f32 {
     let elapsed = (time_ms - entry.time_ms).max(0) as f32;
     if entry.step_x <= 0.0 {
