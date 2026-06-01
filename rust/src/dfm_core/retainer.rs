@@ -34,12 +34,14 @@ impl TrackEntry {
 #[derive(Debug, Clone)]
 struct TrackData {
     tracks: Vec<Vec<TrackEntry>>,
+    last_compact_ms: i64,
 }
 
 impl TrackData {
     fn new() -> Self {
         Self {
             tracks: Vec::new(),
+            last_compact_ms: i64::MIN,
         }
     }
 
@@ -49,17 +51,21 @@ impl TrackData {
         }
     }
 
-    fn compact(&mut self, current_time_ms: i64, current_duration_ms: i64) {
+    fn compact(&mut self, current_time_ms: i64, _current_duration_ms: i64) {
+        if current_time_ms == self.last_compact_ms {
+            return;
+        }
+        self.last_compact_ms = current_time_ms;
         for track in self.tracks.iter_mut() {
             track.retain(|existing| {
-                current_time_ms < existing.end_ms() + current_duration_ms
-                    && current_time_ms > existing.time_ms - existing.duration_ms
+                current_time_ms < existing.end_ms()
             });
         }
     }
 
     fn clear(&mut self) {
         self.tracks.clear();
+        self.last_compact_ms = i64::MIN;
     }
 }
 
@@ -109,7 +115,7 @@ impl DanmakuRetainer {
         let effective_height = view_height * capped_display;
         let track_height = item.paint_height + item.paint_height * self.track_gap_ratio;
         let mut track_count = (effective_height / track_height).floor().max(1.0) as usize;
-        if item.danmaku_type.is_scroll() && (capped_display - 1.0).abs() < 0.001 && track_count > 1 {
+        if (display_area - 1.0).abs() < 0.001 && track_count > 1 {
             track_count -= 1;
         }
         let danmaku_index = item.index as usize;
@@ -143,7 +149,7 @@ impl DanmakuRetainer {
             }
             DanmakuType::FixTop => {
                 self.top_tracks.ensure_track_count(track_count);
-                match select_fixed_track(&entry, &mut self.top_tracks.tracks, track_count) {
+                match select_fixed_track(&entry, &mut self.top_tracks, track_count) {
                     Some((row, was_queued, displaced_index)) => {
                         if was_queued {
                             let last = self.top_tracks.tracks[row].last().unwrap();
@@ -159,7 +165,7 @@ impl DanmakuRetainer {
             }
             DanmakuType::FixBottom => {
                 self.bottom_tracks.ensure_track_count(track_count);
-                match select_fixed_track(&entry, &mut self.bottom_tracks.tracks, track_count) {
+                match select_fixed_track(&entry, &mut self.bottom_tracks, track_count) {
                     Some((row, was_queued, displaced_index)) => {
                         if was_queued {
                             let last = self.bottom_tracks.tracks[row].last().unwrap();
@@ -192,13 +198,35 @@ fn select_scroll_track(
 ) -> Option<(usize, DisplacedIndices)> {
     track_data.compact(new_entry.time_ms, new_entry.duration_ms);
 
+    let overwrite_count = ((track_count as f32 * 0.6).ceil() as usize).max(1).min(track_count);
+    let overwrite_start = track_count - overwrite_count;
+
+    let mut best_track = overwrite_start;
+    let mut min_right_edge = f32::MAX;
+
     for i in 0..track_count {
-        let collides = track_data.tracks[i].iter().any(|existing| {
-            scroll_entries_collide(new_entry, existing, view_width)
-        });
+        if track_data.tracks[i].is_empty() {
+            track_data.tracks[i].push(new_entry.clone());
+            return Some((i, SmallVec::new()));
+        }
+        let mut collides = false;
+        let mut track_min_right = f32::MAX;
+        for existing in &track_data.tracks[i] {
+            if scroll_entries_collide(new_entry, existing, view_width) {
+                collides = true;
+            }
+            let right_edge = entry_right_edge_at(existing, new_entry.time_ms, view_width);
+            if right_edge < track_min_right {
+                track_min_right = right_edge;
+            }
+        }
         if !collides {
             track_data.tracks[i].push(new_entry.clone());
             return Some((i, SmallVec::new()));
+        }
+        if i >= overwrite_start && track_min_right < min_right_edge {
+            min_right_edge = track_min_right;
+            best_track = i;
         }
     }
 
@@ -207,20 +235,6 @@ fn select_scroll_track(
         track_data.tracks[0].clear();
         track_data.tracks[0].push(new_entry.clone());
         return Some((0, displaced));
-    }
-
-    let upper_limit = ((track_count as f32 * 0.6).ceil() as usize).max(1).min(track_count);
-
-    let mut best_track = 0;
-    let mut min_right_edge = f32::MAX;
-    for i in 0..upper_limit {
-        for entry in &track_data.tracks[i] {
-            let right_edge = entry_right_edge_at(entry, new_entry.time_ms, view_width);
-            if right_edge < min_right_edge {
-                min_right_edge = right_edge;
-                best_track = i;
-            }
-        }
     }
 
     if min_right_edge < f32::MAX {
@@ -237,13 +251,35 @@ fn entry_right_edge_at(entry: &TrackEntry, time_ms: i64, view_width: f32) -> f32
     entry_x_at(entry, time_ms, view_width) + entry.paint_width
 }
 
+fn compact_fixed_tracks(tracks: &mut [Vec<TrackEntry>], current_time_ms: i64) {
+    for track in tracks.iter_mut() {
+        let mut remove_count = 0;
+        for entry in track.iter() {
+            if entry.end_ms() <= current_time_ms {
+                remove_count += 1;
+            } else {
+                break;
+            }
+        }
+        if remove_count > 0 {
+            track.drain(0..remove_count);
+        }
+    }
+}
+
 fn select_fixed_track(
     new_entry: &TrackEntry,
-    tracks: &mut [Vec<TrackEntry>],
+    track_data: &mut TrackData,
     track_count: usize,
 ) -> Option<(usize, bool, Option<usize>)> {
     let new_start = new_entry.time_ms;
 
+    if new_start != track_data.last_compact_ms {
+        track_data.last_compact_ms = new_start;
+        compact_fixed_tracks(&mut track_data.tracks, new_start);
+    }
+
+    let tracks = &mut track_data.tracks;
     for i in 0..track_count {
         if tracks[i].is_empty() {
             tracks[i].push(new_entry.clone());
@@ -257,34 +293,12 @@ fn select_fixed_track(
         }
     }
 
-    let mut best_track = 0;
-    let mut earliest_end = i64::MAX;
-    for i in 0..track_count {
-        let last = tracks[i].last().unwrap();
-        let end = last.end_ms();
-        if end < earliest_end {
-            earliest_end = end;
-            best_track = i;
-        }
-    }
-    let last = tracks[best_track].last().unwrap();
-    let displaced_index = last.danmaku_index;
-    let queued_start = earliest_end;
-    let queued = TrackEntry {
-        time_ms: queued_start,
-        duration_ms: new_entry.duration_ms,
-        paint_width: new_entry.paint_width,
-        step_x: new_entry.step_x,
-        danmaku_type: new_entry.danmaku_type,
-        danmaku_index: new_entry.danmaku_index,
-    };
-    tracks[best_track].push(queued);
-    Some((best_track, true, Some(displaced_index)))
+    None
 }
 
 #[inline]
 fn scroll_entries_collide(entry_a: &TrackEntry, entry_b: &TrackEntry, view_width: f32) -> bool {
-    if !check_hit_same_type(entry_a.danmaku_type, entry_b.danmaku_type) {
+    if entry_a.danmaku_type != entry_b.danmaku_type {
         return false;
     }
 
@@ -295,62 +309,52 @@ fn scroll_entries_collide(entry_a: &TrackEntry, entry_b: &TrackEntry, view_width
     };
 
     let d_time = d2.time_ms - d1.time_ms;
-
+    
     if d_time <= 0 {
         return true;
     }
-
+    
     if d_time >= d1.duration_ms as i64 {
         return false;
     }
 
-    let d2_left = entry_left_at_start(d2, view_width);
-    let d1_right_at_d2_start = entry_left_at(d1, d2.time_ms, view_width) + d1.paint_width;
+    let d1_left_at_d2_start = entry_left_at(d1, d2.time_ms, view_width);
+    let d1_right_at_d2_start = d1_left_at_d2_start + d1.paint_width;
+    let d2_left_at_start = entry_left_at_start(d2, view_width);
 
-    if d2.danmaku_type == DanmakuType::ScrollRL {
-        if d2_left < d1_right_at_d2_start {
-            return true;
-        }
-    } else {
-        let d2_right_at_d2_start = d2_left + d2.paint_width;
-        let d1_left_at_d2_start = entry_left_at(d1, d2.time_ms, view_width);
-        if d2_right_at_d2_start > d1_left_at_d2_start {
-            return true;
-        }
+    if check_hit_same_type(d1.danmaku_type, d1_left_at_d2_start, d1_right_at_d2_start, d2_left_at_start, d2_left_at_start + d2.paint_width) {
+        return true;
     }
 
-    let d1_end = d1.end_ms();
-    if d1_end > d2.time_ms {
-        let d1_right_at_end = entry_left_at(d1, d1_end, view_width) + d1.paint_width;
-        let d2_left_at_end = entry_left_at(d2, d1_end, view_width);
+    let d1_left_at_d1_end = entry_left_at(d1, d1.end_ms(), view_width);
+    let d1_right_at_d1_end = d1_left_at_d1_end + d1.paint_width;
+    let d2_left_at_d1_end = entry_left_at(d2, d1.end_ms(), view_width);
 
-        if d2.danmaku_type == DanmakuType::ScrollRL {
-            if d2_left_at_end < d1_right_at_end {
-                return true;
-            }
-        } else {
-            let d2_right_at_end = d2_left_at_end + d2.paint_width;
-            let d1_left_at_end = entry_left_at(d1, d1_end, view_width);
-            if d2_right_at_end > d1_left_at_end {
-                return true;
-            }
-        }
-    }
-
-    false
+    check_hit_same_type(d1.danmaku_type, d1_left_at_d1_end, d1_right_at_d1_end, d2_left_at_d1_end, d2_left_at_d1_end + d2.paint_width)
 }
 
 #[inline]
-fn check_hit_same_type(type1: DanmakuType, type2: DanmakuType) -> bool {
-    type1 == type2 && (type1 == DanmakuType::ScrollRL || type1 == DanmakuType::ScrollLR)
+fn check_hit_same_type(
+    danmaku_type: DanmakuType,
+    left1: f32,
+    right1: f32,
+    left2: f32,
+    right2: f32,
+) -> bool {
+    debug_assert!(danmaku_type.is_scroll());
+    match danmaku_type {
+        DanmakuType::ScrollRL => left2 < right1,
+        DanmakuType::ScrollLR => right2 > left1,
+        _ => false,
+    }
 }
 
 #[inline]
 fn entry_left_at_start(entry: &TrackEntry, view_width: f32) -> f32 {
-    if entry.danmaku_type == DanmakuType::ScrollLR {
-        -entry.paint_width
-    } else {
-        view_width
+    match entry.danmaku_type {
+        DanmakuType::ScrollRL => view_width,
+        DanmakuType::ScrollLR => -entry.paint_width,
+        _ => 0.0,
     }
 }
 
@@ -536,17 +540,11 @@ mod tests {
             make_fixed_item(0, "b", DanmakuType::FixTop, 3800),
         ];
 
-        retainer.fix(&mut items[0], 1920.0, 60.0, &flags, 1.0, false);
-        let (_, displaced1) = retainer.fix(&mut items[1], 1920.0, 60.0, &flags, 1.0, false);
+        let (placed0, _) = retainer.fix(&mut items[0], 1920.0, 60.0, &flags, 1.0, false);
+        assert!(placed0, "first item should be placed in the only track");
 
-        assert_eq!(items[1].time_ms, 3800,
-            "queued item should start when the track frees up");
-        for &d in &displaced1 {
-            items[d].is_filtered = true;
-            items[d].filter_param = 99;
-        }
-        assert!(displaced1.contains(&0), "item 0 should be in displaced list");
-        assert!(items[0].is_filtered, "displaced item should be filtered");
+        let (placed1, _) = retainer.fix(&mut items[1], 1920.0, 60.0, &flags, 1.0, false);
+        assert!(!placed1, "second item should be dropped when all tracks are full");
     }
 
     #[test]
@@ -602,21 +600,14 @@ mod tests {
 
         for i in 0..items.len() {
             items[i].index = i as u32;
-            let (_, displaced) = retainer.fix(&mut items[i], 1920.0, 60.0, &flags, 1.0, false);
-            for &d in &displaced {
-                items[d].is_filtered = true;
-                items[d].filter_param = 99;
+            let (placed, _) = retainer.fix(&mut items[i], 1920.0, 60.0, &flags, 1.0, false);
+            if i == 0 {
+                assert!(placed, "item 0 should be placed (first on empty track)");
+                assert_eq!(items[0].time_ms, 0);
+            } else {
+                assert!(!placed, "item {} should be dropped when all tracks are full", i);
             }
         }
-        assert_eq!(items[0].time_ms, 0);
-        assert_eq!(items[1].time_ms, 3800);
-        assert_eq!(items[2].time_ms, 7600);
-        assert_eq!(items[3].time_ms, 11400);
-
-        assert!(items[0].is_filtered, "item 0 should be filtered after being displaced by item 1");
-        assert!(items[1].is_filtered, "item 1 should be filtered after being displaced by item 2");
-        assert!(items[2].is_filtered, "item 2 should be filtered after being displaced by item 3");
-        assert!(!items[3].is_filtered, "item 3 should not be filtered (last item, shows from 11400-15200)");
     }
 
     #[test]
@@ -689,22 +680,14 @@ mod tests {
 
         for i in 0..items.len() {
             items[i].index = i as u32;
-            let (_, displaced) = retainer.fix(&mut items[i], 1920.0, 60.0, &flags, 1.0, false);
-            for &d in &displaced {
-                items[d].is_filtered = true;
-                items[d].filter_param = 99;
+            let (placed, _) = retainer.fix(&mut items[i], 1920.0, 60.0, &flags, 1.0, false);
+            if i == 0 {
+                assert!(placed, "item 0 should be placed");
+                assert_eq!(items[0].time_ms, 0);
+            } else {
+                assert!(!placed, "item {} should be dropped when all tracks are full", i);
             }
         }
-
-        assert_eq!(items[0].time_ms, 0);
-        assert_eq!(items[1].time_ms, 3800);
-        assert_eq!(items[2].time_ms, 7600);
-        assert_eq!(items[3].time_ms, 11400);
-
-        assert!(items[0].is_filtered, "item 0 should be filtered");
-        assert!(items[1].is_filtered, "item 1 should be filtered");
-        assert!(items[2].is_filtered, "item 2 should be filtered");
-        assert!(!items[3].is_filtered, "item 3 should not be filtered");
     }
 
     #[test]
