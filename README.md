@@ -248,7 +248,7 @@ DFM-Next/
 │           ├── dfm_plus_layout_bridge.dart  # DfmPlusLayoutBridge — 增量配置 + FFI 调用
 │           └── dfm_plus_overlay.dart  # DfmPlusOverlay — Widget + TextureRenderBridge
 │
-├── LICENSE                            # MIT License
+├── LICENSE                            # Apache License 2.0
 └── README.md
 ```
 
