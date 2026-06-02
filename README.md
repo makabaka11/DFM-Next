@@ -248,7 +248,7 @@ DFM-Next/
 │           ├── dfm_plus_layout_bridge.dart  # DfmPlusLayoutBridge — 增量配置 + FFI 调用
 │           └── dfm_plus_overlay.dart  # DfmPlusOverlay — Widget + TextureRenderBridge
 │
-├── LICENSE                            # MIT License
+├── LICENSE                            # Apache License 2.0
 └── README.md
 ```
 
@@ -493,11 +493,14 @@ DfmPlusOverlay(
 | **零 clone 排序** | in-place sort 替代索引排序 + clone，`mem::take` 替代 text clone，`into_iter` 替代 `iter` + clone |
 | **单次遍历合并** | 重复合并从三步（建 HashMap → 标记 → 计数）合并为单次遍历 + 延迟标记 |
 | **合并碰撞扫描** | `select_scroll_track` 将碰撞检测和 overwriteInsert 的 min_right_edge 计算合并为单次遍历 |
+<<<<<<< HEAD
 | **类型预分组** | 单次遍历构建按类型索引数组，消除 O(4N) 全量扫描，同时移除冗余 measure() 调用 |
 | **Copy 类型** | `GlobalFlags` 和 `Duration` derive Copy，消除 `.clone()` 开销 |
 | **统一文本度量** | `measure_text_width_heuristic` 委托 `model::measure_text_width`，使用精确 Unicode 范围判断，消除两处实现不一致 |
 | **ScrollLR 方向感知** | 帧渲染区分 ScrollRL (`width - speed*elapsed`) 和 ScrollLR (`speed*elapsed - paint_width`)，修复左→右弹幕位置错误 |
 | **固定弹幕简化** | `select_fixed_track` 返回 `Option<usize>`，移除 `was_queued` 死代码和 `displaced_index` 空路径 |
+=======
+>>>>>>> bf847ee6f163f5dd757e4db3eb3b60813ec0fbc5
 
 ---
 
