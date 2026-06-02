@@ -29,7 +29,7 @@
 │  │ dfm_plus_layout_frame()  ← 每帧查询 (O(log N))     │   │
 │  │   ├─ LAYOUT_STORE 句柄查找 (避免序列化整个布局)       │   │
 │  │   ├─ partition_point 二分定位                        │   │
-│  │   ├─ X 坐标线性计算 (预存 is_scroll/centered_x)       │   │
+│  │   ├─ X 坐标线性计算 (预存 is_scroll/centered_x, ScrollLR 方向感知)       │   │
 │  │   ├─ FrameCache O(1) LRU 缓存 (VecDeque)            │   │
 │  │   └─ → DfmPlusFrameLayout (item_index 零 String 分配)│   │
 │  └────────────────────────────────────────────────────┘   │
@@ -70,16 +70,18 @@ track_count  = floor(effective_height / track_count)
 ```
 
 **滚动弹幕分配策略：**
-1. 压缩过期条目（`compact`）
-2. 遍历轨道，用 `scroll_entries_collide()` 检测碰撞
-3. 找到无碰撞轨道则放置
-4. 全部碰撞时执行 **overwrite 策略**：在上方 60% 轨道中找最小右边缘的轨道，清除并替换（模拟原版 `overwriteInsert`）
-5. 自己发送的弹幕（`is_me`）始终强制替换第 0 轨道
+1. 压缩过期条目（`compact`）：仅保留 `end_ms()` 尚未到达的条目
+2. 遍历轨道，空轨道直接放置（O(1) 快速路径）
+3. 用 `scroll_entries_collide()` 检测碰撞
+4. 找到无碰撞轨道则放置
+5. 全部碰撞时执行 **overwrite 策略**：在底部 60% 轨道中找最小右边缘的轨道，清除并替换（模拟原版 `overwriteInsert`，顶部 40% 保持稳定）
+6. 自己发送的弹幕（`is_me`）始终强制替换第 0 轨道
 
 **固定弹幕分配策略：**
-1. 遍历轨道，检查新弹幕的开始时间是否晚于轨道最后一条的结束时间
-2. 时间不重叠则追加到同一轨道
-3. 全部占用时 **排队** 到最早结束的轨道：`item.time_ms = earliest_end`，被挤占的旧弹幕标记为已过滤
+1. 压缩过期条目（`compact_fixed_tracks`）：从轨道前端移除 `end_ms <= current_time` 的条目
+2. 遍历轨道，检查新弹幕的开始时间是否晚于轨道最后一条的结束时间
+3. 时间不重叠则追加到同一轨道
+4. 全部占用时 **丢弃**（匹配 Next2 行为，不排队不驱逐）
 
 ### 2. 碰撞检测 (Collision)
 
@@ -135,9 +137,9 @@ if gap < scroll_duration × filter_factor → 过滤
 ```
 
 **关键词/正则屏蔽（移植自 `KeywordFilter`，扩展正则支持）：**
-- 纯文本关键词：`String::contains()` 匹配
+- 纯文本关键词：`AhoCorasick` 自动机单次遍历匹配所有模式，O(m+matches) 复杂度
 - 正则表达式：`规则名称/表达式/` 格式，使用 Rust `regex` crate 编译执行
-- 通过 `set_block_words()` 统一设置，自动解析格式并分别存入 `blocked_keywords` 和 `blocked_regexes`
+- 通过 `set_block_words()` 统一设置，自动解析格式并分别构建 `AhoCorasick` 自动机和 `blocked_regexes`
 
 **重复合并算法（移植自 `DuplicateMergingFilter`）：**
 - 10 秒滑动窗口内首次出现 → 放行并记录
@@ -268,8 +270,8 @@ DFM-Next/
 
 | 算法模块 | 原版 DFM | DFM-Next | 差异说明 |
 |---------|---------|----------|---------|
-| **碰撞检测** | `DanmakuUtils.willHitInDuration()` 两点矩形重叠 | 1:1 移植 + 内联优化，独立 `step_x` 精确处理速度差异 | 原版所有弹幕共享 speed_factor，DFM-Next 每条弹幕独立计算；消除了三层中间调用链 |
-| **轨道分配** | `DanmakusRetainer` 按 Y 排序遍历 + overwrite | 1:1 移植，按类型独立轨道数组 + overwrite 策略 | 结构化为显式轨道数组，避免线性扫描 |
+| **碰撞检测** | `DanmakuUtils.willHitInDuration()` 两点矩形重叠 | 1:1 移植 + 内联优化，独立 `step_x` 精确处理速度差异，5 参数方向感知位置比较 | 原版所有弹幕共享 speed_factor，DFM-Next 每条弹幕独立计算；消除了三层中间调用链 |
+| **轨道分配** | `DanmakusRetainer` 按 Y 排序遍历 + overwrite | 1:1 移植，按类型独立轨道数组 + 底部 60% overwrite 策略 | 结构化为显式轨道数组，顶部轨道保持稳定 |
 | **过滤系统** | 10 种运行时过滤器，渲染循环中实时执行 | 移植 5 种核心过滤器，布局阶段一次执行 | 移植了 Type/Quantity/ElapsedTime/Keyword/Duplicate |
 | **时长计算** | `DanmakuFactory.updateViewportState()` | 1:1 移植，相同公式和常量 | 完全一致 |
 | **字体度量** | `Paint.measureText()` 系统原生精度 | ttf-parser 精确 + 启发式回退 | 可选 GPU 渲染器预测量传入，精度更高 |
@@ -484,10 +486,18 @@ DfmPlusOverlay(
 | **Dart 时间量化** | `(time × 60).round()` 对齐 Rust 帧缓存量化，相同 tick 跳过 `layout()` FRB 调用 |
 | **预存计算** | `is_scroll` + `centered_x` 预计算，帧查询消除 type match 和重复除法 |
 | **EpochFlags** | 6 个 epoch flag 合并为结构体，方便后续冷热数据拆分 |
-| **正则过滤** | `规则名称/表达式/` 格式自动解析为 `regex::Regex`，纯文本关键词走 `contains()` 快速路径 |
+| **正则过滤** | `规则名称/表达式/` 格式自动解析为 `regex::Regex`，纯文本关键词走 `AhoCorasick` 自动机单次匹配 |
 | **增量更新** | Bridge 层 8 项参数变化检测，仅必要时重新调用 `prepare_layout` |
-| **轨道压缩** | `compact` 在每次放置前清除过期条目 |
-| **轻量依赖** | Rust crate 仅依赖 `rustc-hash` + `smallvec` + `regex`（dev-dependencies 除外） |
+| **轨道压缩** | `compact` 在每次放置前清除过期条目，`last_compact_ms` 跳过同时间重复压缩 |
+| **轻量依赖** | Rust crate 仅依赖 `rustc-hash` + `smallvec` + `regex` + `aho-corasick`（dev-dependencies 除外） |
+| **零 clone 排序** | in-place sort 替代索引排序 + clone，`mem::take` 替代 text clone，`into_iter` 替代 `iter` + clone |
+| **单次遍历合并** | 重复合并从三步（建 HashMap → 标记 → 计数）合并为单次遍历 + 延迟标记 |
+| **合并碰撞扫描** | `select_scroll_track` 将碰撞检测和 overwriteInsert 的 min_right_edge 计算合并为单次遍历 |
+| **类型预分组** | 单次遍历构建按类型索引数组，消除 O(4N) 全量扫描，同时移除冗余 measure() 调用 |
+| **Copy 类型** | `GlobalFlags` 和 `Duration` derive Copy，消除 `.clone()` 开销 |
+| **统一文本度量** | `measure_text_width_heuristic` 委托 `model::measure_text_width`，使用精确 Unicode 范围判断，消除两处实现不一致 |
+| **ScrollLR 方向感知** | 帧渲染区分 ScrollRL (`width - speed*elapsed`) 和 ScrollLR (`speed*elapsed - paint_width`)，修复左→右弹幕位置错误 |
+| **固定弹幕简化** | `select_fixed_track` 返回 `Option<usize>`，移除 `was_queued` 死代码和 `displaced_index` 空路径 |
 
 ---
 
@@ -497,7 +507,7 @@ DfmPlusOverlay(
 # Rust 计算层
 cd rust
 cargo build                    # 编译
-cargo test                     # 运行全部单元测试（60+ 测试用例）
+cargo test                     # 运行全部单元测试（55+ 测试用例）
 
 # Flutter 渲染层（需要 flutter_rust_bridge 生成 FFI 绑定）
 cd flutter
