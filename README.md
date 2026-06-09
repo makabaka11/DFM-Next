@@ -30,13 +30,12 @@
 │  │   ├─ LAYOUT_STORE 句柄查找 (避免序列化整个布局)       │   │
 │  │   ├─ partition_point 二分定位                        │   │
 │  │   ├─ X 坐标线性计算 (预存 is_scroll/centered_x, ScrollLR 方向感知)       │   │
-│  │   ├─ FrameCache O(1) LRU 缓存 (VecDeque)            │   │
 │  │   └─ → DfmPlusFrameLayout (item_index 零 String 分配)│   │
 │  └────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**核心思想：** 原版 DFM 每帧实时遍历 TreeSet 做过滤+碰撞+布局，DFM+ 将全部布局计算前移到 `prepare_layout` 阶段一次性完成，每帧仅需 O(log N) 二分查找 + 线性 X 坐标计算，帧开销极低。`DfmPlusFrameItem` 仅返回 `item_index + x/y/offstage_x` 四个数值字段，Dart 端通过索引从 `PreparedLayout` 取文本和样式，帧查询阶段零 String 堆分配。`DfmPlusPreparedLayout` 通过不透明句柄（`handle: u64`）存储在 Rust 侧 `LAYOUT_STORE` 中，`dfm_plus_layout_frame` 仅传递句柄而非整个布局数据，避免每帧 MB 级序列化开销。Dart 端时间量化对齐 Rust 帧缓存，相同量化 tick 跳过 FRB 调用。内部使用 FxHashMap（非密码学安全但 2-3x 更快）替代标准库 HashMap，帧缓存淘汰 O(1) 化。
+**核心思想：** 原版 DFM 每帧实时遍历 TreeSet 做过滤+碰撞+布局，DFM+ 将全部布局计算前移到 `prepare_layout` 阶段一次性完成，每帧仅需 O(log N) 二分查找 + 线性 X 坐标计算，帧开销极低。`DfmPlusFrameItem` 仅返回 `item_index + x/y/offstage_x` 四个数值字段，Dart 端通过索引从 `PreparedLayout` 取文本和样式，帧查询阶段零 String 堆分配。`DfmPlusPreparedLayout` 通过不透明句柄（`handle: u64`）存储在 Rust 侧 `LAYOUT_STORE` 中，`dfm_plus_layout_frame` 仅传递句柄而非整个布局数据，避免每帧 MB 级序列化开销。Dart 端同步帧计算（`DfmPlusLayoutBridge.layout()`），零异步开销。内部使用 FxHashMap（非密码学安全但 2-3x 更快）替代标准库 HashMap。
 
 ---
 
@@ -74,14 +73,14 @@ track_count  = floor(effective_height / track_count)
 2. 遍历轨道，空轨道直接放置（O(1) 快速路径）
 3. 用 `scroll_entries_collide()` 检测碰撞
 4. 找到无碰撞轨道则放置
-5. 全部碰撞时执行 **overwrite 策略**：在底部 60% 轨道中找最小右边缘的轨道，清除并替换（模拟原版 `overwriteInsert`，顶部 40% 保持稳定）
+5. 全部碰撞时执行 **proximity-evict 策略**：保护顶部 40% 轨道（稳定区），在底部 60% 轨道中找最小右边缘的轨道，**仅替换最接近退出的单条弹幕**（而非清除整轨），同时驱逐该轨道上已滚出 85% 以上的弹幕（`EXIT_PROXIMITY_RATIO = 0.15`），中间位置的弹幕继续滚动接受短暂重叠
 6. 自己发送的弹幕（`is_me`）始终强制替换第 0 轨道
 
 **固定弹幕分配策略：**
 1. 压缩过期条目（`compact_fixed_tracks`）：从轨道前端移除 `end_ms <= current_time` 的条目
 2. 遍历轨道，检查新弹幕的开始时间是否晚于轨道最后一条的结束时间
 3. 时间不重叠则追加到同一轨道
-4. 全部占用时 **丢弃**（匹配 Next2 行为，不排队不驱逐）
+4. 全部占用时 **丢弃**（不排队不驱逐，保证已有弹幕不被打断）
 
 ### 2. 碰撞检测 (Collision)
 
@@ -172,13 +171,13 @@ fixed_duration = 3800ms (常量)
 
 GPU 渲染器的描边像素公式：`outline_px = clamp(font_size × 0.06, 1.0, 2.6) × clamp(outline_width, 0.0, 4.0)`
 
-### 6. 帧级缓存 (Frame Cache)
+### 6. 帧查询 (Frame Query)
 
-`layout_frame` 阶段实现了 **帧级 FIFO 缓存**（256 条），以量化时间（1/60s 精度）+ layout cache_key 为键，避免相同时间戳的重复计算。
+`layout_frame` 阶段执行纯 O(K) 计算（K = 可见弹幕数）：
 
-**淘汰策略：** 使用 `VecDeque<u64>` 追踪插入顺序，淘汰时 `pop_front` O(1)，替代了原先 O(n) 的 `min_by_key` 全量扫描。
-
-**缓存键采样：** `cache_key` 只采样前 64 条非过滤弹幕 + 可见条目总数，万级弹幕下哈希计算从 O(n) 降为 O(64)。
+1. 对 `item_times` 执行 `partition_point` 二分查找，定位当前时间窗口
+2. 线性遍历可见弹幕，计算每条的 X 坐标
+3. 返回 `DfmPlusFrameLayout`（仅含 `item_index + x/y/offstage_x`，零 String 分配）
 
 **内部 HashMap：** 使用 `FxHashMap`（基于 FxHash，非密码学安全但 2-3x 更快）替代标准库 `HashMap`（SipHash-2-4）。
 
@@ -217,6 +216,82 @@ struct GlobalFlags {
 
 只需递增全局 epoch，所有 per-item 的标记自然失效，无需遍历集合。
 
+### 9. 频闪消除优化 (Anti-Flicker / Anti-Judder)
+
+滚动弹幕在 60Hz 及以上刷新率下会出现肉眼可见的位置抖动（每帧约 1px 跳动），根本原因是时间精度不足导致帧间位移量交替变化。以下四项优化从时间源、量化精度、缓存策略、异步开销四个层面彻底消除频闪：
+
+#### 高频时钟插值 (High-precision clock interpolation)
+
+播放时间源改用挂钟插值，以 `player.position` 为锚点，实现亚毫秒级精度，而非整数毫秒步进。
+
+```
+interpolated_time = anchor + (now - anchor_wall_time)
+
+漂移修正：
+  drift = interpolated_time - player.position
+  if |drift| > 30ms（seek / 暂停恢复等大跳变）:
+    立即重新锚定（snap）
+  else:
+    interpolated_time -= drift × 0.05   // 每帧修正 5%，渐进收敛
+    更新 anchor
+```
+
+**效果：** 消除了整数毫秒步进导致的 16/17ms 交替 delta，滚动弹幕不再出现每帧 ~1px 的位置抖动。小漂移通过 5% 渐进修正平滑收敛，大跳变（seek、暂停恢复）立即对齐避免长时间偏移。
+
+#### 移除 60fps 量化 (Remove 60fps quantization)
+
+Dart 侧原先使用 `(currentTime * 60).round()` 将时间量化到 1/60s 网格，这意味着同一 16.67ms 窗口内的所有显示帧共享相同的弹幕位置。在 120Hz 及以上显示器上，60fps 量化会导致每隔一帧弹幕位置完全相同（跳帧），视觉上表现为明显的卡顿。
+
+现已替换为直接浮点时间比较，确保每个显示帧都获得唯一的弹幕位置，120Hz+ 显示器下运动完全平滑。
+
+#### 纯计算无缓存 (Pure computation, no cache)
+
+`build_dfm_plus_frame()` 是纯 O(M) 计算（二分查找 + 位置计算，通常 <0.1ms），不需要帧级缓存。每帧都使用完整时间精度重新计算位置，计算开销可忽略，位置精度最大化。
+
+#### Dart 侧同步帧计算 (Dart-side synchronous frame computation)
+
+每帧位置计算（`build_dfm_plus_frame` 逻辑）已从 Rust FFI 迁移至 Dart 侧同步计算。此前每帧需要一次异步 `await dfmPlusLayoutFrame()` FFI 调用，引入至少一个 microtask 延迟。加上其他异步调用（`configure` + `tryUpdateTexture`），3 条 await 链可能超过 16.67ms 帧预算，导致掉帧和可见卡顿。
+
+现在 `DfmPlusLayoutBridge.layout()` 是同步方法：
+- 对 `PreparedLayout.itemTimes`（Float64List）执行二分查找定位可见窗口
+- 使用与 Rust `build_dfm_plus_frame` 相同的公式计算每条可见弹幕的 x/y 位置
+- 立即返回结果，零异步开销
+
+这与 GPU 渲染引擎的做法一致：`layout()` 是 `CustomPainter.paint()` 内的同步调用，确保每次显示刷新都获得最新计算的帧。
+
+**Post-configure 时间重读：** `configure()` 是异步操作（Rust prepare + 字体加载），耗时数十到数百毫秒。期间播放位置可能从 0 跳变到恢复点。为避免绘制 t=0 弹幕，`configure()` 完成后立即重新读取 `playbackTimeMs`。
+
+**关键洞察：** `build_dfm_plus_frame` 是纯 O(M) 计算（二分查找 + 位置数学，即使 Dart 执行通常也 <0.1ms），异步 FFI 开销才是瓶颈，而非计算本身。
+
+### 10. UI 交互防闪烁 (Anti-flicker on UI interaction)
+
+当播放页面 UI 元素（控制栏、进度条、悬浮按钮）触发状态更新时，`DfmPlusOverlay` 的 `didUpdateWidget` 会被调用。如果将 `opacity` 和 `isVisible` 变化等同于布局参数变化（触发 `_forceLayout`），会导致不必要的完整 `configure()` 重跑 + 纹理重建，产生可见的弹幕闪烁。
+
+**修复策略：** 将 `didUpdateWidget` 中的属性变化分为三级：
+
+| 变化类型 | 触发条件 | 处理方式 |
+|---------|---------|---------|
+| 布局参数变化 | 弹幕列表、字号、显示区域、轨道间距等 | `_forceLayout = true` + `_queueUpdate()` — 完整重配置 |
+| 可见性变化 | `isVisible` 切换 | 仅 `_queueUpdate()` — 轻量更新，跳过 `configure()` |
+| 展示层变化 | `opacity` 变化 | 无需更新 — 由 `build()` 中的 `Opacity` widget 处理 |
+
+**Windows 抖动保护：** Windows 平台在窗口失焦时会触发 `didChangeMetrics` 回调，导致 DPR 微小抖动（±0.001）。为避免不必要的纹理重建和引擎重置：
+
+- 布局尺寸变化 >=2px 才触发 `_forceLayout`（亚像素抖动不重算布局）
+- DPR 变化仅更新缓存值，不触发 `_forceLayout`（DPR 仅影响纹理像素大小，不影响弹幕布局）
+- 纹理重建阈值 >=2px（避免 ±1px 像素抖动触发 `ensureTexture` → `isNewEngine` → `resetScene` → 闪烁）
+
+### 11. 对象复用优化 (Object reuse)
+
+每帧 `layout()` 调用原先会创建新的 `List<PositionedDanmakuItem>` 和 `DanmakuContentItem` 对象，造成频繁 GC。现已实现两层复用：
+
+- **布局缓冲区** (`_layoutBuffer`)：`layout()` 方法清空并复用同一个 `List`，避免每帧分配新列表
+- **内容缓存** (`_contentCache`)：以 prepared item index 为键缓存 `DanmakuContentItem`（含 `Color` 对象），同一弹幕在多帧间复用同一内容对象，仅更新 `x`/`y`/`offstageX` 位置字段
+
+### 12. 超采样渲染 (Supersample rendering)
+
+在部分设备（平板、桌面端 DPR < 2.0）上，弹幕纹理以 2x 像素密度渲染，使文字更清晰。通过 `enableSupersample` 构造参数控制，集成方可根据设备类型和用户偏好决定是否启用。
+
 ---
 
 ## 项目结构
@@ -238,15 +313,16 @@ DFM-Next/
 │       │   └── timer.rs               # AdaptiveTimer — 自适应帧率计时器
 │       └── api/
 │           ├── mod.rs
-│           └── dfm_plus.rs            # 公共 API + 帧缓存 (FxHashMap + VecDeque O(1) LRU) + partition_point
+│           └── dfm_plus.rs            # 公共 API (FxHashMap LAYOUT_STORE + partition_point)
 │
 ├── flutter/                           # Flutter 渲染层
 │   ├── pubspec.yaml
 │   └── lib/
 │       └── dfm_plus/
 │           ├── danmaku_types.dart     # DanmakuContentItem, PositionedDanmakuItem
-│           ├── dfm_plus_layout_bridge.dart  # DfmPlusLayoutBridge — 增量配置 + FFI 调用
-│           └── dfm_plus_overlay.dart  # DfmPlusOverlay — Widget + TextureRenderBridge
+│           ├── dfm_plus_api.dart      # Rust API 类型定义（需 flutter_rust_bridge 生成实际绑定）
+│           ├── dfm_plus_layout_bridge.dart  # DfmPlusLayoutBridge — 增量配置 + 同步帧计算
+│           └── dfm_plus_overlay.dart  # DfmPlusOverlay — Widget + 抽象接口 (TextureRenderBridge, EmojiRenderPipeline, OverlayViewport)
 │
 ├── LICENSE                            # Apache License 2.0
 └── README.md
@@ -271,7 +347,7 @@ DFM-Next/
 | 算法模块 | 原版 DFM | DFM-Next | 差异说明 |
 |---------|---------|----------|---------|
 | **碰撞检测** | `DanmakuUtils.willHitInDuration()` 两点矩形重叠 | 1:1 移植 + 内联优化，独立 `step_x` 精确处理速度差异，5 参数方向感知位置比较 | 原版所有弹幕共享 speed_factor，DFM-Next 每条弹幕独立计算；消除了三层中间调用链 |
-| **轨道分配** | `DanmakusRetainer` 按 Y 排序遍历 + overwrite | 1:1 移植，按类型独立轨道数组 + 底部 60% overwrite 策略 | 结构化为显式轨道数组，顶部轨道保持稳定 |
+| **轨道分配** | `DanmakusRetainer` 按 Y 排序遍历 + overwrite | 1:1 移植，按类型独立轨道数组 + 顶部 40% 保护 + 底部 60% proximity-evict 策略 | 结构化为显式轨道数组，仅替换最接近退出的单条弹幕 |
 | **过滤系统** | 10 种运行时过滤器，渲染循环中实时执行 | 移植 5 种核心过滤器，布局阶段一次执行 | 移植了 Type/Quantity/ElapsedTime/Keyword/Duplicate |
 | **时长计算** | `DanmakuFactory.updateViewportState()` | 1:1 移植，相同公式和常量 | 完全一致 |
 | **字体度量** | `Paint.measureText()` 系统原生精度 | ttf-parser 精确 + 启发式回退 | 可选 GPU 渲染器预测量传入，精度更高 |
@@ -285,7 +361,7 @@ DFM-Next/
 | 单帧布局复杂度 | O(N × M) 遍历所有可见弹幕 × 轨道 | O(log N) 二分查找 + O(K) 可见弹幕 |
 | 碰撞检测调用 | 每帧每条弹幕对每条轨道 | 仅 prepare 阶段一次 |
 | 内存分配 | 每帧创建临时对象 (Rect, Paint) | prepare 阶段分配，帧查询零分配 |
-| 缓存 | 三级 Bitmap 缓存 + 对象池 | 帧级 FIFO 缓存 (O(1) 淘汰) + FxHashMap |
+| 缓存 | 三级 Bitmap 缓存 + 对象池 | FxHashMap + 对象复用 (_layoutBuffer / _contentCache) |
 | 渲染 | CPU Canvas (受弹幕密度限制) | GPU 并行 (高密度下优势明显) |
 
 ### 功能对比
@@ -406,6 +482,8 @@ DfmPlusOverlay(
   shadowStyle: DanmakuShadowStyle.medium,
   opacity: 1.0,
   isVisible: true,
+  blockWords: const [],              // 关键词/正则屏蔽列表
+  enableSupersample: false,          // 超采样渲染（平板/低DPR设备建议开启）
   textureBridge: myTextureBridge,     // 可选：GPU 纹理渲染
   emojiPipeline: myEmojiPipeline,     // 可选：Emoji 渲染管线
   onLayoutCalculated: (items) { ... }, // 布局结果回调
@@ -434,6 +512,8 @@ DfmPlusOverlay(
 | `mergeDanmaku` | bool | false | - | 合并重复弹幕为 "xN" |
 | `maxQuantity` | u32? | null | - | 最大同屏弹幕数（密度控制） |
 | `maxLinesPerType` | u32? | null | - | 每种类型最大轨道数 |
+| `blockWords` | List\<String\> | [] | - | 关键词/正则屏蔽列表 |
+| `enableSupersample` | bool | false | - | 超采样渲染（2x 像素密度，平板/低DPR设备建议开启） |
 
 ---
 
@@ -457,11 +537,10 @@ DfmPlusOverlay(
       │
       ▼
 3. 每帧: DfmPlusLayoutBridge.layout(currentTimeSeconds)
-   └─ dfm_plus_layout_frame()
-       ├─ FrameCache FIFO 命中检查 (O(1) 淘汰)
+   └─ 同步帧计算 (Dart 侧)
        ├─ partition_point → 可见弹幕范围
        ├─ 线性计算 X 坐标
-       └─ → List<DfmPlusFrameItem>
+       └─ → List<PositionedDanmakuItem>
       │
       ▼
 4. DfmPlusOverlay._tryUpdateTexture()
@@ -477,13 +556,11 @@ DfmPlusOverlay(
 |------|------|
 | **预计算架构** | `prepare_layout` 一次性完成全部碰撞检测和轨道分配，`layout_frame` 仅做二分查找 + X 坐标计算 |
 | **O(log N) 帧查询** | 按时间排序的 `item_times` 数组 + 标准库 `partition_point` 二分查找 |
-| **帧级 FIFO 缓存** | 256 条容量，量化时间键（1/60s 精度），O(1) 淘汰（VecDeque），相同时间戳直接命中 |
 | **FxHashMap** | 全局替换标准库 HashMap/HashSet，非密码学安全但 2-3x 更快 |
 | **SmallVec** | overwrite 路径 `SmallVec<[usize; 4]>` 替代 `Vec<usize>`，少量 displaced 时零堆分配 |
 | **惰性清理** | `filter_duplicate` 的 `retain` 仅在 HashMap 超过 128 条时执行，消除 O(n²) |
 | **帧查询零分配** | `DfmPlusFrameItem` 仅含 `item_index + x/y/offstage_x`，无 String clone，通过索引从 PreparedLayout 取样式 |
 | **不透明句柄** | `DfmPlusPreparedLayout.handle` + Rust 侧 `LAYOUT_STORE`，帧查询仅传递 8 字节句柄，避免每帧 MB 级布局序列化 |
-| **Dart 时间量化** | `(time × 60).round()` 对齐 Rust 帧缓存量化，相同 tick 跳过 `layout()` FRB 调用 |
 | **预存计算** | `is_scroll` + `centered_x` 预计算，帧查询消除 type match 和重复除法 |
 | **EpochFlags** | 6 个 epoch flag 合并为结构体，方便后续冷热数据拆分 |
 | **正则过滤** | `规则名称/表达式/` 格式自动解析为 `regex::Regex`，纯文本关键词走 `AhoCorasick` 自动机单次匹配 |
@@ -493,14 +570,17 @@ DfmPlusOverlay(
 | **零 clone 排序** | in-place sort 替代索引排序 + clone，`mem::take` 替代 text clone，`into_iter` 替代 `iter` + clone |
 | **单次遍历合并** | 重复合并从三步（建 HashMap → 标记 → 计数）合并为单次遍历 + 延迟标记 |
 | **合并碰撞扫描** | `select_scroll_track` 将碰撞检测和 overwriteInsert 的 min_right_edge 计算合并为单次遍历 |
-<<<<<<< HEAD
 | **类型预分组** | 单次遍历构建按类型索引数组，消除 O(4N) 全量扫描，同时移除冗余 measure() 调用 |
 | **Copy 类型** | `GlobalFlags` 和 `Duration` derive Copy，消除 `.clone()` 开销 |
 | **统一文本度量** | `measure_text_width_heuristic` 委托 `model::measure_text_width`，使用精确 Unicode 范围判断，消除两处实现不一致 |
 | **ScrollLR 方向感知** | 帧渲染区分 ScrollRL (`width - speed*elapsed`) 和 ScrollLR (`speed*elapsed - paint_width`)，修复左→右弹幕位置错误 |
 | **固定弹幕简化** | `select_fixed_track` 返回 `Option<usize>`，移除 `was_queued` 死代码和 `displaced_index` 空路径 |
-=======
->>>>>>> bf847ee6f163f5dd757e4db3eb3b60813ec0fbc5
+| **UI 交互防闪烁** | `didUpdateWidget` 分级处理：布局参数变化触发完整重配置，`isVisible` 仅轻量更新，`opacity` 由展示层处理 |
+| **对象复用** | `_layoutBuffer` 复用列表 + `_contentCache` 复用 `DanmakuContentItem`，帧查询零临时对象分配 |
+| **超采样可配置** | `enableSupersample` 构造参数控制 2x 像素密度渲染，集成方可按设备类型和用户偏好启用 |
+| **Windows 抖动保护** | 布局尺寸变化 >=2px 才触发重配置，DPR 变化不触发布局重算，纹理重建阈值 >=2px |
+| **Post-configure 时间重读** | `configure()` 完成后重新读取播放时间，避免异步期间播放位置跳变导致绘制 t=0 弹幕 |
+| **Proximity-evict** | overwrite 策略仅替换最接近退出的单条弹幕 + 驱逐已 85%+ 出屏的条目，避免整轨清除导致的批量消失 |
 
 ---
 
