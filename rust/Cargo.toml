@@ -2,7 +2,7 @@
 name = "dfm-plus"
 version = "0.1.0"
 edition = "2021"
-description = "DFM+ danmaku engine — a Rust port of Bilibili's DanmakuFlameMaster layout algorithms"
+description = "DFM+ danmaku engine — a Rust port of Bilibili's DanmakuFlameMaster layout algorithms with native GPU rendering"
 license = "MIT"
 repository = "https://github.com/nipaplay/DFM+"
 keywords = ["danmaku", "barrage", "bilibili", "dfm", "layout"]
@@ -16,6 +16,38 @@ rustc-hash = "2"
 smallvec = "1"
 regex = "1"
 aho-corasick = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22.1"
+bytemuck = { version = "1.24.0", features = ["derive"] }
+wgpu = "27.0.1"
+pollster = "0.4.0"
+fdsm = { version = "0.8.0", default-features = false }
+fdsm-ttf-parser = "0.2.0"
+ttf-parser = "0.25.1"
+image = { version = "0.25.6", default-features = false }
+nalgebra = { version = "0.34.1", default-features = false, features = ["std"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+wgpu-hal = { version = "27.0.4", features = ["metal"] }
+metal = "0.32.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu-hal = { version = "27.0.4", features = ["dx12"] }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu-hal = { version = "27.0.4", features = ["gles"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni-sys = "0.4.1"
+ndk-sys = "0.6.0+11769913"
+raw-window-handle = "0.6.2"
 
 [dev-dependencies]
 serde_json = "1"
