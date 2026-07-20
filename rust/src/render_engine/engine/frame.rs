@@ -3,6 +3,12 @@ struct FramePayload {
     items: Vec<FrameItemPayload>,
     #[serde(default)]
     emoji_glyphs: Option<Vec<FrameEmojiGlyphPayload>>,
+    /// Chars to prefetch-rasterize asynchronously (lookahead pre-warming).
+    /// Each char is dispatched via `atlas.request_rasterize` at the current
+    /// font_size; results land in the atlas via `drain_prefetch`. Dart sends
+    /// only the delta (chars not yet prefetched) to keep payload small.
+    #[serde(default)]
+    prefetch_chars: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -136,3 +142,4 @@ fn decode_emoji_rasters(payloads: &[FrameEmojiGlyphPayload]) -> Vec<EmojiRasterD
     }
     out
 }
+

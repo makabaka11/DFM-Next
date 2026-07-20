@@ -226,6 +226,24 @@ class _DfmPlusOverlayState extends State<DfmPlusOverlay>
   /// wall-clock baseline (the overlay may not have ticked during the seek).
   static const double _hardResyncThresholdSec = 1.0;
 
+  /// Lookahead window (seconds) for rolling glyph prefetch - danmaku entering
+  /// the screen within this window have their chars async-rasterized so they
+  /// hit the atlas before display. 3s balances worker throughput vs coverage.
+  static const double _prefetchLookaheadSec = 3.0;
+
+  /// First-frame prefetch window after configure. Kept equal to the rolling
+  /// window (3s) - a larger first-frame window (e.g. 15s) caused a long
+  /// first-frame stall because all those chars hit the synchronous fallback
+  /// before workers finished. 3s covers the on-screen burst; the rolling 3s
+  /// lookahead picks up the rest. Combined with the ensureTexture-time early
+  /// prefetch (isInitialPrefetch in _tryUpdateTexture), workers get a head
+  /// start before the first draw.
+  static const double _initialPrefetchLookaheadSec = 3.0;
+
+  /// Whether the initial large-window prefetch has been done since the last
+  /// configure. Reset to false when configure runs.
+  bool _initialPrefetchDone = false;
+
   // ── Submit-rate throttle ──
   // On high-refresh panels (>60Hz) the Dart layout+setFrame pipeline is
   // capped at 60Hz; the native renderer interpolates scroll motion between
@@ -582,6 +600,8 @@ class _DfmPlusOverlayState extends State<DfmPlusOverlay>
           // Reset after configure so motion resumes from the current media time
           // with a fresh wall-clock baseline.
           _resetDisplayTimeToMedia();
+          // Re-arm the initial large-window prefetch for the new content.
+          _initialPrefetchDone = false;
         }
 
         // ── Submit-rate throttle ──
@@ -607,7 +627,24 @@ class _DfmPlusOverlayState extends State<DfmPlusOverlay>
         // drains its mpsc queue and always renders the latest submission.
         final frame = _bridge.layout(interpolatedTime);
 
-        await _tryUpdateTexture(frame);
+        // Lookahead prefetch: dispatch chars from danmaku entering the screen
+        // in the next few seconds to the Rust MSDF workers (async), so glyphs
+        // are ready in the atlas before display. First frame after configure
+        // uses a large window to pre-warm the opening minute (OP/character
+        // names); subsequent frames send only the small rolling delta.
+        final bool isInitialPrefetch = !_initialPrefetchDone;
+        final double prefetchLookahead = isInitialPrefetch
+            ? _initialPrefetchLookaheadSec
+            : _prefetchLookaheadSec;
+        final String? prefetchChars =
+            _bridge.prefetchChars(_displayMediaTime, prefetchLookahead);
+
+        await _tryUpdateTexture(
+          frame,
+          prefetchChars: prefetchChars,
+          isInitialPrefetch: isInitialPrefetch,
+        );
+        _initialPrefetchDone = true;
         widget.onLayoutCalculated?.call(frame);
       }
     } catch (_) {
@@ -618,7 +655,11 @@ class _DfmPlusOverlayState extends State<DfmPlusOverlay>
     }
   }
 
-  Future<bool> _tryUpdateTexture(List<PositionedDanmakuItem> frame) async {
+  Future<bool> _tryUpdateTexture(
+    List<PositionedDanmakuItem> frame, {
+    String? prefetchChars,
+    bool isInitialPrefetch = false,
+  }) async {
     if (!DfmPlatformSupport.isNativeTextureSupported || _layoutSize.isEmpty) {
       return false;
     }
@@ -675,7 +716,7 @@ class _DfmPlusOverlayState extends State<DfmPlusOverlay>
       _lastTextureHeight = pixelHeight;
       _lastTextureSurfaceId = _surfaceId;
 
-      final info = await _textureBridge.ensureTexture(
+      final info = await _textureBridge.ensure_texture(
         surfaceId: _surfaceId,
         width: pixelWidth,
         height: pixelHeight,
@@ -743,6 +784,38 @@ class _DfmPlusOverlayState extends State<DfmPlusOverlay>
         .clamp(0.25, 8.0)
         .toDouble();
 
+    // 优化1（首播）：texture 就绪 + fontScale 已算，立即投递首屏预热给 worker，
+    // 然后等 worker 算几帧再继续首帧 draw。首帧 draw 时部分首屏字符已 drain 填入
+    // atlas，减少 sync 兜底阻塞。代价：首帧延迟 200ms（弹幕晚 200ms 显示），
+    // 换首播卡顿减小。仅首播首帧执行（isInitialPrefetch）。
+    String? effectivePrefetch = prefetchChars;
+    if (isInitialPrefetch &&
+        effectivePrefetch != null &&
+        effectivePrefetch.isNotEmpty) {
+      try {
+        await _textureBridge.setFrame(
+          items: const <PositionedDanmakuItem>[],
+          fontSize: widget.fontSize,
+          outlineWidth: widget.outlineWidth,
+          shadowStyle: widget.shadowStyle,
+          opacity: 1.0,
+          customFontFamily: widget.customFontFamily,
+          customFontFilePath: widget.customFontFilePath,
+          scaleX: widthScale,
+          scaleY: heightScale,
+          fontScale: fontScale,
+          playbackRate: widget.playbackRate,
+          framePayload: <String, dynamic>{
+            'items': const <Map<String, dynamic>>[],
+            'prefetch_chars': effectivePrefetch,
+          },
+        );
+        await Future.delayed(const Duration(milliseconds: 200));
+      } catch (_) {}
+      if (!mounted) return false;
+      effectivePrefetch = null;
+    }
+
     final prepared = await _emojiPipeline.buildPayload(
       items: frame,
       fontSize: widget.fontSize,
@@ -752,6 +825,15 @@ class _DfmPlusOverlayState extends State<DfmPlusOverlay>
       locale: locale,
       playbackRate: widget.playbackRate,
     );
+
+    // Augment the payload with prefetch_chars (rolling lookahead delta).
+    // The standalone DfmEmojiPipeline.buildPayload does not accept
+    // prefetchChars directly, so we splice it into the serialized payload
+    // here — matching the integrated Next2EmojiPipeline.toJson() behavior.
+    final payload = prepared.toJson();
+    if (effectivePrefetch != null && effectivePrefetch.isNotEmpty) {
+      payload['prefetch_chars'] = effectivePrefetch;
+    }
 
     final pushed = await _textureBridge.setFrame(
       items: frame,
@@ -765,7 +847,7 @@ class _DfmPlusOverlayState extends State<DfmPlusOverlay>
       scaleY: heightScale,
       fontScale: fontScale,
       playbackRate: widget.playbackRate,
-      framePayload: prepared.toJson(),
+      framePayload: payload,
     );
 
     if (pushed) {

@@ -42,6 +42,11 @@ class DfmPlusLayoutBridge {
   /// for wall-clock incremental positioning.
   final Map<int, PositionedDanmakuItem> _positionedCache = {};
 
+  /// Code points already dispatched for async prefetch-rasterization.
+  /// Deduplicates so each frame sends only the delta (new chars entering the
+  /// lookahead window). Cleared on configure (layout/font change).
+  final Set<int> _prefetched = {};
+
   /// Soft-prune bookkeeping. On long videos where the danmaku list /
   /// font size never change, configure() (which clears the caches) is never
   /// re-invoked, so _contentCache/_positionedCache grow unbounded as the
@@ -151,6 +156,7 @@ class DfmPlusLayoutBridge {
     // Layout changed — content and position caches are stale, clear them
     _contentCache.clear();
     _positionedCache.clear();
+    _prefetched.clear();
   }
 
   /// Synchronous layout: computes frame positions in Dart using the
@@ -266,6 +272,45 @@ class DfmPlusLayoutBridge {
     return result;
   }
 
+  /// Lookahead prefetch: returns a string of chars appearing in danmaku with
+  /// time in [currentTime, currentTime + lookaheadSec] that haven't been
+  /// prefetched yet (the delta), or null if no new chars. Recorded chars are
+  /// added to `_prefetched` so subsequent calls skip them.
+  ///
+  /// Drives async MSDF rasterization on the Rust side so glyphs are ready in
+  /// the atlas before the danmaku enters the visible window - avoids the
+  /// synchronous rasterize-and-block fallback that causes frame hitches.
+  String? prefetchChars(double currentTime, double lookaheadSec) {
+    final prepared = _prepared;
+    if (prepared == null) return null;
+    final items = prepared.items;
+    final itemTimes = prepared.itemTimes;
+    if (items.isEmpty || itemTimes.isEmpty) return null;
+
+    final end = currentTime + lookaheadSec;
+    final startIdx = _upperBound(itemTimes, currentTime);
+    final endIdx = _upperBound(itemTimes, end);
+    if (startIdx >= endIdx) return null;
+
+    final buf = StringBuffer();
+    for (int i = startIdx; i < endIdx; i++) {
+      final text = items[i].text;
+      for (final code in text.runes) {
+        if (_prefetched.add(code)) {
+          buf.writeCharCode(code);
+        }
+      }
+    }
+    if (buf.isEmpty) return null;
+    return buf.toString();
+  }
+
+  /// Reset prefetch tracking. Called on configure (layout/font/danmaku change)
+  /// so the new content gets freshly prefetched.
+  void resetPrefetch() {
+    _prefetched.clear();
+  }
+
   /// Binary search: first index where itemTimes[i] >= target.
   int _lowerBound(Float64List times, double target) {
     int lo = 0;
@@ -304,6 +349,7 @@ class DfmPlusLayoutBridge {
     _prepared = null;
     _contentCache.clear();
     _positionedCache.clear();
+    _prefetched.clear();
   }
 
   bool _sameLayoutConfig(

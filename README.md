@@ -281,6 +281,7 @@ class _DanmakuDemoPageState extends State<DanmakuDemoPage> {
 | DPR 缓存 + 像素阈值 ≥2px | Windows 失焦 DPR 微抖动不触发纹理重建 |
 | `isNewEngine` 不 resetScene | 避免清除字形图集导致 MSDF 重建阻塞渲染线程 |
 | 非阻塞 MSDF 栅格化 | `entry_for()` 返回 None + 4ms 预算异步栅格化 |
+| 字符预取预热 | `prefetchChars()` 预取未来 3s 内弹幕字符，首帧空 setFrame + 200ms 预热减少 sync 兜底阻塞 |
 | 提交间隔 EMA 自适应门控 | Rust 原生追踪 Dart 提交间隔；EMA ≤20ms（60fps 喂满）时关闭插值，>20ms 时开启补帧 |
 | 空帧短路 | 无弹幕时跳过 JSON 编码和 MethodChannel 调用 |
 | 超采样 0.0/1.5/2.0 | 低 DPR 设备以 1.5x 或 2x 像素密度渲染后缩放，文字更清晰 |
