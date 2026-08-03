@@ -481,6 +481,8 @@ impl DfmRenderer {
             let quantized_size = item.font_size.round().clamp(8.0, 256.0) as u32;
             let baseline_y = item.y as f32 + self.atlas.line_ascent(quantized_size);
             let tokens = &item.tokens;
+            let item_left = cursor_x;
+            let mut visual_bounds: Option<RenderBounds> = None;
 
             for token in tokens {
                 match token {
@@ -503,6 +505,17 @@ impl DfmRenderer {
                             let glyph_top = baseline_y + entry.offset_y;
                             let glyph_right = glyph_left + entry.width as f32;
                             let glyph_bottom = glyph_top + entry.height as f32;
+
+                            if item.is_me {
+                                let visible_inset = (entry.spread - outline_px - 1.0).max(0.0);
+                                include_render_bounds(
+                                    &mut visual_bounds,
+                                    glyph_left + visible_inset,
+                                    glyph_top + visible_inset,
+                                    glyph_right - visible_inset,
+                                    glyph_bottom - visible_inset,
+                                );
+                            }
 
                             if shadow.opacity > 0.0 {
                                 self.push_shadow_quad(
@@ -550,6 +563,23 @@ impl DfmRenderer {
                         let glyph_right = glyph_left + entry.width as f32;
                         let glyph_bottom = glyph_top + entry.height as f32;
 
+                        if item.is_me {
+                            let horizontal_padding =
+                                ((entry.width as f32 - entry.advance.max(0.0)) * 0.5).max(0.0);
+                            let vertical_padding =
+                                ((entry.height as f32 - item.font_size) * 0.5).max(0.0);
+                            let emoji_margin = emoji_outline_px + 1.0;
+                            let inset_x = (horizontal_padding - emoji_margin).max(0.0);
+                            let inset_y = (vertical_padding - emoji_margin).max(0.0);
+                            include_render_bounds(
+                                &mut visual_bounds,
+                                glyph_left + inset_x,
+                                glyph_top + inset_y,
+                                glyph_right - inset_x,
+                                glyph_bottom - inset_y,
+                            );
+                        }
+
                         if shadow.opacity > 0.0 {
                             self.push_shadow_quad(
                                 (glyph_left + shadow.offset_x) * SHADOW_RENDER_SCALE,
@@ -582,6 +612,46 @@ impl DfmRenderer {
                         cursor_x += entry.advance.max(1.0) + side_bearing * 2.0;
                     }
                 }
+            if item.is_me {
+                if let Some(marker) = resolve_self_marker_bounds(
+                    item_left,
+                    cursor_x,
+                    item.width,
+                    item.y as f32,
+                    item.font_size,
+                    visual_bounds,
+                ) {
+                    let stroke = self_marker_stroke(item.font_size);
+                    let left = marker.left;
+                    let top = marker.top;
+                    let right = marker.right;
+                    let bottom = marker.bottom;
+                    let color = [0.0, 1.0, 0.0, item.opacity];
+                    let params = [1.0, 0.0, GLYPH_MODE_SOLID, 0.0];
+                    let uv = [0.0, 0.0];
+
+                    self.push_quad(
+                        left, top, right, top + stroke,
+                        uv, uv, uv, uv,
+                        color, color, params,
+                    );
+                    self.push_quad(
+                        left, bottom - stroke, right, bottom,
+                        uv, uv, uv, uv,
+                        color, color, params,
+                    );
+                    self.push_quad(
+                        left, top + stroke, left + stroke, bottom - stroke,
+                        uv, uv, uv, uv,
+                        color, color, params,
+                    );
+                    self.push_quad(
+                        right - stroke, top + stroke, right, bottom - stroke,
+                        uv, uv, uv, uv,
+                        color, color, params,
+                    );
+                }
+            }
             }
         }
 
@@ -744,6 +814,99 @@ impl DfmRenderer {
 
         self.vertices.extend_from_slice(&[v0, v1, v2, v0, v2, v3]);
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RenderBounds {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+fn include_render_bounds(
+    bounds: &mut Option<RenderBounds>,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+) {
+    if !left.is_finite()
+        || !top.is_finite()
+        || !right.is_finite()
+        || !bottom.is_finite()
+        || right <= left
+        || bottom <= top
+    {
+        return;
+    }
+    match bounds {
+        Some(current) => {
+            current.left = current.left.min(left);
+            current.top = current.top.min(top);
+            current.right = current.right.max(right);
+            current.bottom = current.bottom.max(bottom);
+        }
+        None => {
+            *bounds = Some(RenderBounds {
+                left,
+                top,
+                right,
+                bottom,
+            });
+        }
+    }
+}
+
+fn self_marker_padding(font_size: f32) -> f32 {
+    (font_size * 0.12).clamp(4.0, 9.0)
+}
+
+fn self_marker_stroke(font_size: f32) -> f32 {
+    (font_size * 0.08).clamp(2.5, 5.0)
+}
+
+fn resolve_self_marker_bounds(
+    item_left: f32,
+    cursor_x: f32,
+    fallback_width: f32,
+    item_y: f32,
+    font_size: f32,
+    visual: Option<RenderBounds>,
+) -> Option<RenderBounds> {
+    let advance_width = (cursor_x - item_left).max(0.0);
+    let advance_right = item_left
+        + if advance_width > 0.0 {
+            advance_width
+        } else {
+            fallback_width.max(0.0)
+        };
+
+    let (mut left, mut right) = (item_left, advance_right);
+    if let Some(bounds) = visual {
+        left = left.min(bounds.left);
+        right = right.max(bounds.right);
+    }
+    if !left.is_finite() || !right.is_finite() || right <= left {
+        return None;
+    }
+
+    let safe_font_size = font_size.max(1.0);
+    let (content_top, content_bottom) = if let Some(bounds) = visual {
+        let center = (bounds.top + bounds.bottom) * 0.5;
+        let height = (bounds.bottom - bounds.top).max(safe_font_size);
+        (center - height * 0.5, center + height * 0.5)
+    } else {
+        (item_y, item_y + safe_font_size)
+    };
+    let padding = self_marker_padding(safe_font_size);
+
+    Some(RenderBounds {
+        left: left - padding,
+        top: content_top - padding,
+        right: right + padding,
+        bottom: content_bottom + padding,
+    })
 }
 
 fn create_render_texture_with_usage(

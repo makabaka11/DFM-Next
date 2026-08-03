@@ -8,6 +8,7 @@ import 'danmaku_types.dart';
 // 原始导入: import 'package:nipaplay/src/rust/api/dfm_plus.dart' as rust_dfm;
 // 生成后请将此行替换为: import 'dfm_plus_api.dart' as rust_dfm;
 import 'dfm_plus_api.dart' as rust_dfm;
+import 'dfm_emoji_pipeline.dart';
 
 // TODO: 需要确保 Rust 初始化后再调用布局方法
 // 原始导入: import 'package:nipaplay/src/rust/rust_init.dart';
@@ -25,6 +26,7 @@ class DfmPlusLayoutBridge {
   double _lastOutlineWidth = -1;
   String _lastCustomFontFamily = '';
   String _lastCustomFontFilePath = '';
+  String _lastLocaleTag = '';
   List<String> _lastBlockWords = const [];
 
   Uint8List? _cachedFontBytes;
@@ -72,8 +74,10 @@ class DfmPlusLayoutBridge {
     double outlineWidth = 0.0,
     String customFontFamily = '',
     String customFontFilePath = '',
+    Locale? locale,
     List<String> blockWords = const [],
   }) async {
+    final localeTag = locale?.toLanguageTag() ?? '';
     final listIdentity = identityHashCode(danmakuList);
     final changed = listIdentity != _sourceListIdentity ||
         danmakuListVersion != _sourceListVersion ||
@@ -85,6 +89,7 @@ class DfmPlusLayoutBridge {
         (_lastOutlineWidth - outlineWidth).abs() > 0.001 ||
         _lastCustomFontFamily != customFontFamily ||
         _lastCustomFontFilePath != customFontFilePath ||
+        _lastLocaleTag != localeTag ||
         !listEquals(_lastBlockWords, blockWords) ||
         !_sameLayoutConfig(
           _prepared!,
@@ -104,6 +109,19 @@ class DfmPlusLayoutBridge {
     final fontBytes = await _loadFontBytes(customFontFilePath);
 
     final rawItems = <rust_dfm.DfmPlusRawDanmakuItem>[];
+    final widthPlans = <List<_DfmWidthPart>>[];
+    final plainRuns = <String>[];
+    final plainRunIndices = <String, int>{};
+    final emojiWidths = <String, double>{};
+
+    int plainRunIndex(String text) {
+      return plainRunIndices.putIfAbsent(text, () {
+        final index = plainRuns.length;
+        plainRuns.add(text);
+        return index;
+      });
+    }
+
     for (final raw in danmakuList) {
       final text = (raw['content'] ?? raw['c'])?.toString() ?? '';
       if (text.isEmpty) {
@@ -123,25 +141,84 @@ class DfmPlusLayoutBridge {
           isMe: isMe,
         ),
       );
+
+      final parts = <_DfmWidthPart>[];
+      var plainBuffer = StringBuffer();
+      void flushPlainRun() {
+        if (plainBuffer.isEmpty) return;
+        final plain = plainBuffer.toString();
+        parts.add(_DfmWidthPart.plain(plainRunIndex(plain)));
+        plainBuffer = StringBuffer();
+      }
+
+      for (final cluster in text.characters) {
+        if (DfmEmojiPipeline.isEmojiCluster(cluster)) {
+          flushPlainRun();
+          final advance = emojiWidths.putIfAbsent(
+            cluster,
+            () => DfmEmojiPipeline.measureEmojiLayoutAdvance(
+              cluster,
+              fontSize,
+              locale,
+            ),
+          );
+          parts.add(_DfmWidthPart.emoji(advance));
+        } else {
+          plainBuffer.write(cluster);
+        }
+      }
+      flushPlainRun();
+      widthPlans.add(parts);
     }
 
     // TODO: 确保 Rust 运行时已初始化后再调用
     // await ensureRustInitialized();
-    _prepared = await rust_dfm.dfmPlusPrepareLayoutFull(
-      rawItems: rawItems,
-      width: size.width,
-      height: size.height,
-      fontSize: fontSize,
-      displayArea: displayArea,
-      scrollDurationSeconds: scrollDurationSeconds,
-      allowStacking: allowStacking,
-      mergeDanmaku: mergeDanmaku,
-      maxQuantity: maxQuantity,
-      maxLinesPerType: maxLinesPerType,
-      trackGapRatio: trackGapRatio,
-      outlineWidth: outlineWidth,
-      customFontBytes: fontBytes,
-      blockWords: blockWords,
+    final List<double> plainWidths = plainRuns.isEmpty
+        ? const <double>[]
+        : await rust_dfm.dfmPlusMeasureTextWidths(
+            texts: plainRuns,
+            fontSize: fontSize,
+            customFontBytes: fontBytes,
+          );
+    final paintHeight = fontSize * 1.2;
+    final measuredItems = <rust_dfm.DfmPlusDanmakuItem>[];
+    for (var i = 0; i < rawItems.length; i++) {
+      final raw = rawItems[i];
+      var paintWidth = 0.0;
+      for (final part in widthPlans[i]) {
+        paintWidth += part.plainIndex == null
+            ? part.emojiAdvance
+            : plainWidths[part.plainIndex!];
+      }
+      measuredItems.add(
+        rust_dfm.DfmPlusDanmakuItem(
+          timeSeconds: raw.timeSeconds,
+          text: raw.text,
+          typeCode: raw.typeCode,
+          colorArgb: raw.colorArgb,
+          isMe: raw.isMe,
+          paintWidth: paintWidth,
+          paintHeight: paintHeight,
+        ),
+      );
+    }
+
+    _prepared = await rust_dfm.dfmPlusPrepareLayout(
+      request: rust_dfm.DfmPlusPrepareRequest(
+        items: measuredItems,
+        width: size.width,
+        height: size.height,
+        fontSize: fontSize,
+        displayArea: displayArea,
+        scrollDurationSeconds: scrollDurationSeconds,
+        allowStacking: allowStacking,
+        mergeDanmaku: mergeDanmaku,
+        maxQuantity: maxQuantity,
+        maxLinesPerType: maxLinesPerType,
+        trackGapRatio: trackGapRatio,
+        outlineWidth: outlineWidth,
+        blockWords: blockWords,
+      ),
     );
     _sourceListIdentity = listIdentity;
     _sourceListVersion = danmakuListVersion;
@@ -152,6 +229,7 @@ class DfmPlusLayoutBridge {
     _lastOutlineWidth = outlineWidth;
     _lastCustomFontFamily = customFontFamily;
     _lastCustomFontFilePath = customFontFilePath;
+    _lastLocaleTag = localeTag;
     _lastBlockWords = List.unmodifiable(blockWords);
     // Layout changed — content and position caches are stale, clear them
     _contentCache.clear();
@@ -454,4 +532,11 @@ class DfmPlusLayoutBridge {
         return DanmakuItemType.scroll;
     }
   }
+}
+
+class _DfmWidthPart {
+  const _DfmWidthPart.plain(this.plainIndex) : emojiAdvance = 0.0;
+  const _DfmWidthPart.emoji(this.emojiAdvance) : plainIndex = null;
+  final int? plainIndex;
+  final double emojiAdvance;
 }

@@ -11,15 +11,22 @@ class DfmPreparedFramePayload {
   const DfmPreparedFramePayload({
     required this.items,
     required this.emojiGlyphs,
+    this.prefetchChars,
   });
 
   final List<Map<String, dynamic>> items;
   final List<Map<String, dynamic>> emojiGlyphs;
 
+  /// Delta chars to prefetch-rasterize asynchronously on the Rust side
+  /// (lookahead pre-warming). Null/empty = no prefetch this frame.
+  final String? prefetchChars;
+
   Map<String, dynamic> toJson() {
     return <String, dynamic>{
       'items': items,
       if (emojiGlyphs.isNotEmpty) 'emoji_glyphs': emojiGlyphs,
+      if (prefetchChars != null && prefetchChars!.isNotEmpty)
+        'prefetch_chars': prefetchChars,
     };
   }
 }
@@ -51,11 +58,11 @@ class DfmEmojiPipeline {
     if (text.isEmpty) return const <Map<String, dynamic>>[];
     // Quick emoji presence check without iterating unless likely.
     for (final cluster in text.characters) {
-      if (_looksLikeEmojiCluster(cluster)) {
+      if (isEmojiCluster(cluster)) {
         return null; // has emoji → not cacheable here
       }
     }
-    final key = '${fontSize.round().clamp(8, 256)} $text';
+    final key = '${fontSize.round().clamp(8, 256)}\u0000$text';
     final cached = _plainTokenCache[key];
     if (cached != null) {
       // LRU touch
@@ -89,6 +96,7 @@ class DfmEmojiPipeline {
     required double fontScale,
     required Locale? locale,
     double playbackRate = 1.0,
+    String? prefetchChars,
   }) async {
     final List<Map<String, dynamic>> encodedItems = <Map<String, dynamic>>[];
     final Map<String, _EmojiBuildRequest> pending =
@@ -128,6 +136,8 @@ class DfmEmojiPipeline {
         'y': item.y * scaleY,
         'color_argb': item.content.color.toARGB32().toSigned(32),
         'font_size_multiplier': item.content.fontSizeMultiplier,
+        'is_me': item.content.isMe,
+        'width': item.width * scaleX,
         // Signed scroll velocity in TEXTURE px/s (RL<0, LR>0, static=0).
         // Lets the native renderer interpolate `x_render = x + scroll_speed*dt`
         // between Dart submissions, so 30fps submits yield smooth 60/120fps
@@ -177,6 +187,7 @@ class DfmEmojiPipeline {
     return DfmPreparedFramePayload(
       items: encodedItems,
       emojiGlyphs: visibleGlyphs,
+      prefetchChars: prefetchChars,
     );
   }
 
@@ -217,7 +228,7 @@ class DfmEmojiPipeline {
     final plainBuffer = StringBuffer();
 
     for (final cluster in text.characters) {
-      if (_looksLikeEmojiCluster(cluster)) {
+      if (isEmojiCluster(cluster)) {
         if (plainBuffer.isNotEmpty) {
           out.add(<String, dynamic>{
             'k': 't',
@@ -261,27 +272,11 @@ class DfmEmojiPipeline {
     _EmojiBuildRequest request,
     Locale? locale,
   ) async {
-    final style = TextStyle(
-      fontSize: request.fontSize,
-      fontWeight: FontWeight.normal,
-      color: Colors.white,
-      height: 1.0,
-      leadingDistribution: TextLeadingDistribution.even,
+    final painter = _layoutEmojiPainter(
+      request.cluster,
+      request.fontSize,
+      locale,
     );
-
-    final painter = TextPainter(
-      text: TextSpan(text: request.cluster, style: style),
-      textDirection: TextDirection.ltr,
-      textAlign: TextAlign.left,
-      locale: locale,
-      maxLines: 1,
-      textWidthBasis: TextWidthBasis.parent,
-      textHeightBehavior: const TextHeightBehavior(
-        applyHeightToFirstAscent: true,
-        applyHeightToLastDescent: true,
-      ),
-    )..layout(minWidth: 0.0, maxWidth: double.infinity);
-
     final width = painter.width;
     final height = painter.height;
     if (!width.isFinite || !height.isFinite || width <= 0 || height <= 0) {
@@ -339,7 +334,10 @@ class DfmEmojiPipeline {
 
   static String _emojiKey(String emoji, int fontPx) => '$fontPx::$emoji';
 
-  bool _looksLikeEmojiCluster(String cluster) {
+  /// Uses the same grapheme classification for layout measurement and GPU
+  /// tokenization. Keeping this public avoids the collision system treating a
+  /// ZWJ/flag/skin-tone sequence differently from the renderer.
+  static bool isEmojiCluster(String cluster) {
     if (cluster.isEmpty) {
       return false;
     }
@@ -353,7 +351,46 @@ class DfmEmojiPipeline {
     return hasEmojiRune;
   }
 
-  bool _isEmojiRune(int rune) {
+  /// Logical-width advance reserved by DFM+ for one emoji token. The base
+  /// advance comes from the exact TextPainter used to build the emoji bitmap;
+  /// the extra bearing mirrors renderer_draw's two-sided emoji bearing.
+  static double measureEmojiLayoutAdvance(
+    String cluster,
+    double fontSize,
+    Locale? locale,
+  ) {
+    final painter = _layoutEmojiPainter(cluster, fontSize, locale);
+    final sideBearing = (fontSize * 0.08).clamp(1.0, 5.0).toDouble();
+    return painter.width + sideBearing * 2.0;
+  }
+
+  static TextPainter _layoutEmojiPainter(
+    String cluster,
+    double fontSize,
+    Locale? locale,
+  ) {
+    final style = TextStyle(
+      fontSize: fontSize,
+      fontWeight: FontWeight.normal,
+      color: Colors.white,
+      height: 1.0,
+      leadingDistribution: TextLeadingDistribution.even,
+    );
+    return TextPainter(
+      text: TextSpan(text: cluster, style: style),
+      textDirection: TextDirection.ltr,
+      textAlign: TextAlign.left,
+      locale: locale,
+      maxLines: 1,
+      textWidthBasis: TextWidthBasis.parent,
+      textHeightBehavior: const TextHeightBehavior(
+        applyHeightToFirstAscent: true,
+        applyHeightToLastDescent: true,
+      ),
+    )..layout(minWidth: 0.0, maxWidth: double.infinity);
+  }
+
+  static bool _isEmojiRune(int rune) {
     return (rune >= 0x1F000 && rune <= 0x1FAFF) ||
         (rune >= 0x1FC00 && rune <= 0x1FFFF) ||
         (rune >= 0x2600 && rune <= 0x27BF) ||

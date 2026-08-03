@@ -168,6 +168,7 @@ pub fn dfm_plus_prepare_layout(
     let outline_width = request.outline_width.max(0.0) as f32;
     // Compute effective outline pixels matching GPU renderer's resolve_outline_px()
     let outline_px = resolve_outline_px(font_size, outline_width);
+    let mut is_me_flags: Vec<bool> = request.items.iter().map(|raw| raw.is_me).collect();
     let mut items: Vec<DanmakuItem> = request
         .items
         .into_iter()
@@ -221,6 +222,7 @@ pub fn dfm_plus_prepare_layout(
             match merge_map.get_mut(&text_hash) {
                 Some((first_idx, count)) => {
                     if item.text == items[*first_idx].text {
+                        is_me_flags[*first_idx] |= is_me_flags[i];
                         dup_indices.push(i);
                         *count += 1;
                     }
@@ -236,7 +238,14 @@ pub fn dfm_plus_prepare_layout(
         }
         for &(first_idx, count) in merge_map.values() {
             if count > 1 {
-                items[first_idx].text.push_str(&format!(" x{}", count));
+                let suffix = format!(" x{}", count);
+                let suffix_width = crate::dfm_core::model::measure_text_width(&suffix, font_size);
+                let item = &mut items[first_idx];
+                item.text.push_str(&suffix);
+                item.paint_width += suffix_width;
+                if item.danmaku_type.is_scroll() {
+                    item.step_x = (width + item.paint_width) / item.duration_ms as f32;
+                }
             }
         }
     }
@@ -246,7 +255,10 @@ pub fn dfm_plus_prepare_layout(
     if let Some(q) = request.max_quantity {
         filter_sys.max_quantity = Some(q);
     }
-    filter_sys.duplicate_merge = request.merge_danmaku;
+    // Duplicates are already merged above, before track allocation. Running
+    // the stateful duplicate filter again would compare the generated `xN`
+    // suffix against literal user text and could hide unrelated comments.
+    filter_sys.duplicate_merge = false;
     filter_sys.set_block_words(&request.block_words);
 
     let scroll_duration = Duration::new(scroll_dur_ms);
@@ -261,6 +273,11 @@ pub fn dfm_plus_prepare_layout(
 
     // Apply primary filters
     for (i, item) in items.iter_mut().enumerate() {
+        // Duplicate items were already collapsed by the merge pass above.
+        // Do not let filter_primary clear that pre-filtered state.
+        if item.is_filtered {
+            continue;
+        }
         ctx.index_in_screen = i;
         filter_sys.filter_primary(item, &ctx);
     }
@@ -293,13 +310,17 @@ pub fn dfm_plus_prepare_layout(
 
     for (type_idx, &danmaku_type) in type_order.iter().enumerate() {
         for &i in &type_indices[type_idx] {
+            let is_me = is_me_flags
+                .get(items[i].index as usize)
+                .copied()
+                .unwrap_or(false);
             let (placed, displaced_index) = retainer.fix(
                 &mut items[i],
                 width,
                 height,
                 &global_flags,
                 display_area,
-                false,
+                is_me,
             );
             if !placed {
                 continue;
@@ -332,7 +353,10 @@ pub fn dfm_plus_prepare_layout(
             text: std::mem::take(&mut item.text),
             type_code,
             color_argb: item.text_color as i32,
-            is_me: false,
+            is_me: is_me_flags
+                .get(item.index as usize)
+                .copied()
+                .unwrap_or(false),
             font_size_multiplier: 1.0,
             count_text: None,
             track_index: 0,
@@ -492,7 +516,7 @@ pub struct DfmPlusFontMetrics {
 pub fn dfm_plus_font_metrics(
     font_size: f64,
     outline_width: f64,
-    _custom_font_bytes: Option<Vec<u8>>,
+    custom_font_bytes: Option<Vec<u8>>,
 ) -> Result<DfmPlusFontMetrics, String> {
     let fs = font_size as f32;
     let ow = outline_width as f32;
@@ -512,9 +536,14 @@ pub fn dfm_plus_font_metrics(
 pub fn dfm_plus_measure_text_width(
     text: String,
     font_size: f64,
-    _custom_font_bytes: Option<Vec<u8>>,
+    custom_font_bytes: Option<Vec<u8>>,
 ) -> Result<f64, String> {
-    Ok(crate::dfm_core::measure::measure_text_width_heuristic(&text, font_size as f32) as f64)
+    let widths = crate::dfm_core::measure::measure_text_widths_exact(
+        &[text],
+        font_size as f32,
+        custom_font_bytes.as_deref(),
+    )?;
+    Ok(widths.first().copied().unwrap_or(1.0) as f64)
 }
 
 /// Measure widths of multiple text strings in a single call (amortizes font loading).
@@ -522,12 +551,16 @@ pub fn dfm_plus_measure_text_width(
 pub fn dfm_plus_measure_text_widths(
     texts: Vec<String>,
     font_size: f64,
-    _custom_font_bytes: Option<Vec<u8>>,
+    custom_font_bytes: Option<Vec<u8>>,
 ) -> Result<Vec<f64>, String> {
-    Ok(texts
-        .iter()
-        .map(|t| crate::dfm_core::measure::measure_text_width_heuristic(t, font_size as f32) as f64)
-        .collect())
+    Ok(crate::dfm_core::measure::measure_text_widths_exact(
+        &texts,
+        font_size as f32,
+        custom_font_bytes.as_deref(),
+    )?
+    .into_iter()
+    .map(f64::from)
+    .collect())
 }
 
 pub fn dfm_plus_prepare_layout_full(
@@ -543,7 +576,7 @@ pub fn dfm_plus_prepare_layout_full(
     max_lines_per_type: Option<u32>,
     track_gap_ratio: f64,
     outline_width: f64,
-    _custom_font_bytes: Option<Vec<u8>>,
+    custom_font_bytes: Option<Vec<u8>>,
     block_words: Vec<String>,
 ) -> Result<DfmPlusPreparedLayout, String> {
     let fs = font_size as f32;
@@ -551,10 +584,15 @@ pub fn dfm_plus_prepare_layout_full(
     let _outline_px = resolve_outline_px(fs, ow);
 
     let paint_height = crate::dfm_core::measure::measure_line_height_heuristic(fs) as f64;
-    let widths: Vec<f64> = raw_items
-        .iter()
-        .map(|raw| crate::dfm_core::measure::measure_text_width_heuristic(&raw.text, fs) as f64)
-        .collect();
+    let texts: Vec<String> = raw_items.iter().map(|raw| raw.text.clone()).collect();
+    let widths: Vec<f64> = crate::dfm_core::measure::measure_text_widths_exact(
+        &texts,
+        fs,
+        custom_font_bytes.as_deref(),
+    )?
+    .into_iter()
+    .map(f64::from)
+    .collect();
 
     let items: Vec<DfmPlusDanmakuItem> = raw_items
         .into_iter()

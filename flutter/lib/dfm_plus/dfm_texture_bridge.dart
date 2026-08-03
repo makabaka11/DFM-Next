@@ -187,6 +187,8 @@ class DfmTextureBridge {
       'y': item.y * scaleY,
       'color_argb': item.content.color.toARGB32().toSigned(32),
       'font_size_multiplier': item.content.fontSizeMultiplier,
+      'is_me': item.content.isMe,
+      'width': item.width * scaleX,
       // Mirror DfmEmojiPipeline._signedScrollSpeed so the fallback path
       // (framePayload == null) stays consistent with the production path.
       // playbackRate folds video speed into the velocity so native
