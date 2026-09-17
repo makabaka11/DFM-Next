@@ -386,9 +386,12 @@ fn create_linux_gl_device_context(loader: GlProcLoader) -> Result<Arc<EngineDevi
         eprintln!("wgpu linux GL uncaptured error: {err}");
     }));
 
+    let device = Arc::new(device);
+    let completion_driver = GpuCompletionDriver::start(Arc::clone(&device))?;
     Ok(Arc::new(EngineDeviceContext {
-        device: Arc::new(device),
+        device,
         queue: Arc::new(queue),
+        completion_driver,
     }))
 }
 
