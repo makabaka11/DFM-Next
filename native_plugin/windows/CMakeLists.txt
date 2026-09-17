@@ -15,6 +15,7 @@ set(_RUST_MANIFEST_DIR "")
 set(_RUST_MANIFEST_CANDIDATES
   "${CMAKE_CURRENT_SOURCE_DIR}/../../rust"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../rust"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../../rust"
 )
 foreach(_candidate IN LISTS _RUST_MANIFEST_CANDIDATES)
   if (EXISTS "${_candidate}/Cargo.toml")

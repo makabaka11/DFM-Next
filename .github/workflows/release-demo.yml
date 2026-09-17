@@ -11,6 +11,7 @@ permissions:
 
 env:
   FLUTTER_VERSION: '3.44.6'
+  CARGOKIT_VERBOSE: '1'
 
 jobs:
   android:
@@ -120,6 +121,7 @@ jobs:
         shell: pwsh
         run: |
           flutter pub get
+          cargo build --release --manifest-path ..\rust\Cargo.toml --target x86_64-pc-windows-msvc
           flutter build windows --release
           Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "$env:GITHUB_WORKSPACE\DFM-Plus-$env:GITHUB_REF_NAME-Windows-x64.zip" -CompressionLevel Optimal
       - uses: actions/upload-artifact@v4
@@ -149,6 +151,7 @@ jobs:
         working-directory: demo
         run: |
           flutter pub get
+          cargo build --release --manifest-path ../rust/Cargo.toml --target x86_64-unknown-linux-gnu
           flutter build linux --release
           tar -C build/linux/x64/release/bundle -czf "$GITHUB_WORKSPACE/DFM-Plus-${GITHUB_REF_NAME}-Linux-x64.tar.gz" .
       - uses: actions/upload-artifact@v4
