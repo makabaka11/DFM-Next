@@ -1,11 +1,12 @@
 /// DFM+ public API for flutter_rust_bridge.
-/// Provides two entry points matching the Next2 API style:
+/// Provides two entry points matching the DFM API style:
 /// - dfm_plus_prepare_layout: one-time layout computation
 /// - dfm_plus_layout_frame: per-frame position query
 ///
-/// Output format is compatible with Next2's FrameItemPayload (JSON),
-/// allowing direct reuse of Next2's GPU rendering pipeline.
+/// Output format is compatible with DFM's FrameItemPayload (JSON),
+/// allowing direct reuse of DFM's GPU rendering pipeline.
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -20,7 +21,7 @@ use crate::dfm_core::{
 // ---------------------------------------------------------------------------
 
 /// Input danmaku item for layout preparation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DfmPlusDanmakuItem {
     pub time_seconds: f64,
     pub text: String,
@@ -35,7 +36,7 @@ pub struct DfmPlusDanmakuItem {
 }
 
 /// Layout preparation request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DfmPlusPrepareRequest {
     pub items: Vec<DfmPlusDanmakuItem>,
     pub width: f64,
@@ -53,7 +54,7 @@ pub struct DfmPlusPrepareRequest {
 }
 
 /// Prepared layout result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DfmPlusPreparedLayout {
     pub handle: u64,
     pub width: f64,
@@ -77,7 +78,7 @@ impl DfmPlusPreparedLayout {
 }
 
 /// Single prepared item with layout information.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DfmPlusPreparedItem {
     pub time_seconds: f64,
     pub text: String,
@@ -97,14 +98,14 @@ pub struct DfmPlusPreparedItem {
 }
 
 /// Per-frame layout request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DfmPlusFrameRequest {
     pub layout_handle: u64,
     pub current_time_seconds: f64,
 }
 
 /// Per-frame layout result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DfmPlusFrameLayout {
     pub items: Vec<DfmPlusFrameItem>,
 }
@@ -112,7 +113,7 @@ pub struct DfmPlusFrameLayout {
 /// Single frame item with computed position.
 /// Only contains the item index and position data — no text/style clones.
 /// The Dart side uses item_index to look up text/style from PreparedLayout.items.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DfmPlusFrameItem {
     pub item_index: i32,
     pub x: f64,
@@ -166,8 +167,8 @@ pub fn dfm_plus_prepare_layout(
 
     // Build danmaku items
     let outline_width = request.outline_width.max(0.0) as f32;
-    // Compute effective outline pixels matching GPU renderer's resolve_outline_px()
-    let outline_px = resolve_outline_px(font_size, outline_width);
+    // Compute effective outline pixels using the same profile as the GPU renderer.
+    let outline_px = crate::render_engine::resolve_danmaku_outline_px(font_size, outline_width);
     let mut is_me_flags: Vec<bool> = request.items.iter().map(|raw| raw.is_me).collect();
     let mut items: Vec<DanmakuItem> = request
         .items
@@ -308,7 +309,7 @@ pub fn dfm_plus_prepare_layout(
         }
     }
 
-    for (type_idx, &danmaku_type) in type_order.iter().enumerate() {
+    for (type_idx, &_danmaku_type) in type_order.iter().enumerate() {
         for &i in &type_indices[type_idx] {
             let is_me = is_me_flags
                 .get(items[i].index as usize)
@@ -487,19 +488,8 @@ fn upper_bound(times: &[f64], target: f64) -> usize {
     times.partition_point(|&t| t <= target)
 }
 
-/// Compute the effective outline width in pixels, matching the GPU renderer's
-/// `resolve_outline_px(font_size, outline_width)` exactly:
-/// `(font_size * 0.06).clamp(1.0, 2.6) * outline_width.clamp(0.0, 4.0)`
-fn resolve_outline_px(font_size: f32, outline_width: f32) -> f32 {
-    let multiplier = outline_width.clamp(0.0, 4.0);
-    if multiplier <= 0.0 || !multiplier.is_finite() {
-        return 0.0;
-    }
-    (font_size * 0.06).clamp(1.0, 2.6) * multiplier
-}
-
 /// Font metrics matching the GPU renderer's layout parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DfmPlusFontMetrics {
     /// Line ascent matching GPU's `line_ascent()`: `max(px * 0.82, max_face_ascender)`.
     pub ascent: f64,
@@ -507,7 +497,7 @@ pub struct DfmPlusFontMetrics {
     pub descent: f64,
     /// Total line height = ascent + descent.
     pub line_height: f64,
-    /// Effective outline width in pixels, matching GPU's `resolve_outline_px()`.
+    /// Effective outline width in pixels, matching the GPU outline profile.
     pub outline_px: f64,
 }
 
@@ -516,7 +506,7 @@ pub struct DfmPlusFontMetrics {
 pub fn dfm_plus_font_metrics(
     font_size: f64,
     outline_width: f64,
-    custom_font_bytes: Option<Vec<u8>>,
+    _custom_font_bytes: Option<Vec<u8>>,
 ) -> Result<DfmPlusFontMetrics, String> {
     let fs = font_size as f32;
     let ow = outline_width as f32;
@@ -524,14 +514,12 @@ pub fn dfm_plus_font_metrics(
         ascent: (fs * 0.9) as f64,
         descent: (fs * 0.3) as f64,
         line_height: crate::dfm_core::measure::measure_line_height_heuristic(fs) as f64,
-        outline_px: resolve_outline_px(fs, ow) as f64,
+        outline_px: crate::render_engine::resolve_danmaku_outline_px(fs, ow) as f64,
     })
 }
 
-/// Measure the rendered width of a single text string using the same font metrics
-/// as the GPU glyph atlas (glyph_hor_advance → scale_to_px → max fallback).
-///
-/// This ensures collision detection widths match rendering widths exactly.
+/// Measure a plain-text width for DFM+ layout with the GPU renderer's font
+/// order and horizontal advances, without creating a texture atlas.
 /// `custom_font_bytes`: optional custom font file contents (pass None to use default embedded font).
 pub fn dfm_plus_measure_text_width(
     text: String,
@@ -581,7 +569,7 @@ pub fn dfm_plus_prepare_layout_full(
 ) -> Result<DfmPlusPreparedLayout, String> {
     let fs = font_size as f32;
     let ow = outline_width as f32;
-    let _outline_px = resolve_outline_px(fs, ow);
+    let _outline_px = crate::render_engine::resolve_danmaku_outline_px(fs, ow);
 
     let paint_height = crate::dfm_core::measure::measure_line_height_heuristic(fs) as f64;
     let texts: Vec<String> = raw_items.iter().map(|raw| raw.text.clone()).collect();
@@ -628,7 +616,7 @@ pub fn dfm_plus_prepare_layout_full(
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DfmPlusRawDanmakuItem {
     pub time_seconds: f64,
     pub text: String,
@@ -709,6 +697,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a NipaPlay local danmaku fixture"]
     fn test_real_danmaku_no_top_overlap() {
         let json_str = fs::read_to_string(
             "/Users/retr0/Documents/program_works/NipaPlay-Reload/测试弹幕.json",
@@ -844,6 +833,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn merged_item_width_includes_the_count_suffix() {
+        let make_item = |is_me| DfmPlusDanmakuItem {
+            time_seconds: 0.0,
+            text: "😀".into(),
+            type_code: 1,
+            color_argb: 0xffffffffu32 as i32,
+            is_me,
+            paint_width: 30.0,
+            paint_height: 24.0,
+        };
+        let layout = dfm_plus_prepare_layout(DfmPlusPrepareRequest {
+            items: vec![make_item(false), make_item(true)],
+            width: 1920.0,
+            height: 1080.0,
+            font_size: 20.0,
+            display_area: 1.0,
+            scroll_duration_seconds: 8.0,
+            allow_stacking: false,
+            merge_danmaku: true,
+            max_quantity: None,
+            max_lines_per_type: None,
+            track_gap_ratio: 0.15,
+            outline_width: 0.0,
+            block_words: vec![],
+        })
+        .expect("prepare merged layout");
+
+        assert_eq!(layout.items.len(), 1);
+        assert_eq!(layout.items[0].text, "😀 x2");
+        assert!(layout.items[0].is_me);
+        assert!(layout.items[0].width > 30.0);
     }
 
     #[test]
@@ -1082,7 +1105,7 @@ mod tests {
         let scroll_dur_ms = (scroll_dur_secs * 1000.0) as i64;
         let global_flags = crate::dfm_core::model::GlobalFlags::default();
         let outline_width = 0.0_f64.max(0.0) as f32;
-        let outline_px = resolve_outline_px(font_size, outline_width);
+        let outline_px = crate::render_engine::resolve_danmaku_outline_px(font_size, outline_width);
 
         let mut danmaku_items: Vec<crate::dfm_core::model::DanmakuItem> = items
             .iter()
@@ -1202,6 +1225,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a NipaPlay local danmaku fixture"]
     fn test_real_danmaku_local_file() {
         // 先运行我们的调试函数！
         debug_real_danmaku();

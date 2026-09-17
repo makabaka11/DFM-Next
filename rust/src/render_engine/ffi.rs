@@ -3,13 +3,13 @@ use std::ffi::{c_char, c_void, CStr};
 use std::sync::mpsc;
 
 #[cfg(target_os = "windows")]
-use super::create_windows_dxgi_shared_texture;
+use super::engine::create_windows_dxgi_shared_texture;
 #[cfg(not(target_os = "linux"))]
-use super::{
+use super::engine::{
     create_engine, lookup_engine, dfm_log, remove_engine, EngineCommand, RenderFrameInput,
 };
 #[cfg(target_os = "linux")]
-use super::{
+use super::engine::{
     create_linux_gl_engine, dfm_log, poll_linux_gl_frame_ready, remove_linux_gl_engine,
     render_linux_gl_texture, reset_linux_gl_engine, resize_linux_gl_engine, set_linux_gl_frame,
     GlProcLoader, RenderFrameInput,
@@ -21,6 +21,17 @@ fn parse_c_string(ptr: *const c_char) -> Option<String> {
     }
     let c_str = unsafe { CStr::from_ptr(ptr) };
     c_str.to_str().ok().map(ToOwned::to_owned)
+}
+
+/// Nonblocking vsync notification: no JSON, layout, or GPU work on the caller.
+#[cfg(target_os = "windows")]
+#[no_mangle]
+pub extern "C" fn dfm_engine_vsync(handle: u64, elapsed_us: u64) -> u8 {
+    std::panic::catch_unwind(|| {
+        lookup_engine(handle).is_some_and(|entry| entry.cmd_tx.send(EngineCommand::Vsync {
+            arrived: std::time::Instant::now(), elapsed_us,
+        }).is_ok()) as u8
+    }).unwrap_or(0)
 }
 
 #[no_mangle]
@@ -73,7 +84,7 @@ pub extern "C" fn dfm_engine_poll_frame_ready(handle: u64) -> bool {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            super::poll_frame_ready(handle)
+            super::engine::poll_frame_ready(handle)
         }
     }));
     match result {
@@ -86,6 +97,51 @@ pub extern "C" fn dfm_engine_poll_frame_ready(handle: u64) -> bool {
                 .unwrap_or("unknown");
             dfm_log(&format!("FFI poll_frame_ready PANIC: {msg}"));
             false
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[no_mangle]
+pub extern "C" fn dfm_engine_prefetch_pending(handle: u64) -> i64 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::engine::query_prefetch_pending(handle)
+            .and_then(|count| i64::try_from(count).ok())
+            .unwrap_or(-1)
+    }));
+    result.unwrap_or(-1)
+}
+
+/// Latest GPU frame whose submission has completed on this engine.
+#[cfg(not(target_os = "linux"))]
+#[no_mangle]
+pub extern "C" fn dfm_engine_published_frame_serial(handle: u64) -> u64 {
+    std::panic::catch_unwind(|| {
+        lookup_engine(handle)
+            .map(|entry| entry.completion.completed_sequence())
+            .unwrap_or(0)
+    }).unwrap_or(0)
+}
+
+#[cfg(target_os = "windows")]
+#[no_mangle]
+pub extern "C" fn dfm_engine_set_frame_ready_event(handle: u64, event_handle: usize) -> u8 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lookup_engine(handle)
+            .map(|entry| entry.completion.bind_windows_event(event_handle))
+            .unwrap_or(false)
+    }));
+    match result {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| e.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown");
+            dfm_log(&format!("FFI set_frame_ready_event PANIC: {msg}"));
+            0
         }
     }
 }
@@ -203,6 +259,7 @@ pub extern "C" fn dfm_engine_dispose(handle: u64) {
         let Some(entry) = remove_engine(handle) else {
             return;
         };
+        entry.completion.close();
         let _ = entry.cmd_tx.send(EngineCommand::Stop);
     }
 }

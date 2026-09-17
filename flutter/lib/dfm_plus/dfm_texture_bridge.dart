@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/services.dart';
 import 'danmaku_types.dart';
 import 'dfm_platform_support.dart';
+import 'dfm_native_vsync.dart';
 
 class DfmTextureInfo {
   const DfmTextureInfo({
@@ -20,12 +21,26 @@ class DfmTextureInfo {
   final bool isNewEngine;
 }
 
+class DfmPrewarmState {
+  const DfmPrewarmState({
+    required this.publishedFrameSerial,
+    required this.pendingGlyphs,
+  });
+
+  final int publishedFrameSerial;
+  final int pendingGlyphs;
+}
+
 class DfmTextureBridge {
   static const MethodChannel _channel = MethodChannel('dfm_plus/texture');
 
   static bool get isSupported => DfmPlatformSupport.isNativeTextureSupported;
 
   int? _engineHandle;
+  bool signalVsync(int elapsedUs) {
+    final handle = _engineHandle;
+    return handle != null && DfmNativeVsync.signal(handle, elapsedUs);
+  }
 
   Future<DfmTextureInfo?> ensureTexture({
     required String surfaceId,
@@ -94,6 +109,7 @@ class DfmTextureBridge {
     double fontScale = 1.0,
     double playbackRate = 1.0,
     Map<String, dynamic>? framePayload,
+    String motionMode = 'legacy_interpolation',
   }) async {
     if (!isSupported) {
       return false;
@@ -104,25 +120,28 @@ class DfmTextureBridge {
       return false;
     }
 
-    final payload = framePayload ??
-        <String, dynamic>{
-          'items': items
-              .map(
-                (item) => _itemToJson(
-                  item,
-                  scaleX: scaleX,
-                  scaleY: scaleY,
-                  playbackRate: playbackRate,
-                ),
-              )
-              .toList(growable: false),
-        };
+    final payload = <String, dynamic>{
+      ...?framePayload,
+      if (framePayload == null)
+        'items': items
+            .map(
+              (item) => _itemToJson(
+                item,
+                scaleX: scaleX,
+                scaleY: scaleY,
+                playbackRate: playbackRate,
+              ),
+            )
+            .toList(growable: false),
+      'motion_mode': motionMode,
+    };
 
+    final frameJson = jsonEncode(payload);
     final ok = await _channel.invokeMethod<bool>(
       'setFrame',
       <String, dynamic>{
         'engineHandle': engineHandle,
-        'frameJson': jsonEncode(payload),
+        'frameJson': frameJson,
         'fontSize': fontSize * fontScale,
         'outlineWidth': outlineWidth,
         'shadowStyle': _shadowStyleCode(shadowStyle),
@@ -131,8 +150,68 @@ class DfmTextureBridge {
         'customFontFilePath': customFontFilePath,
       },
     );
-
     return ok == true;
+  }
+
+  Future<DfmPrewarmState?> getDfmPrewarmState() async {
+    final engineHandle = _engineHandle;
+    if (!isSupported || engineHandle == null || engineHandle <= 0) {
+      return null;
+    }
+    try {
+      final raw = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+        'getDfmPrewarmState',
+        <String, dynamic>{'engineHandle': engineHandle},
+      );
+      if (raw == null) return null;
+      final serial = (raw['publishedFrameSerial'] as num?)?.toInt();
+      final pending = (raw['pendingGlyphs'] as num?)?.toInt();
+      if (serial == null || pending == null) return null;
+      return DfmPrewarmState(
+        publishedFrameSerial: serial,
+        pendingGlyphs: pending,
+      );
+    } on MissingPluginException {
+      return null;
+    } on PlatformException catch (e) {
+      if (e.code == 'plugin_detached' ||
+          e.code == 'surface_disposed' ||
+          e.code == 'engine_unavailable') {
+        return null;
+      }
+      rethrow;
+    }
+  }
+
+  Future<DfmPrewarmState?> waitForDfmPrewarm({
+    required int publishedAfter,
+    required Duration timeout,
+  }) async {
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      final state = await getDfmPrewarmState();
+      if (state == null) return null;
+      if (state.pendingGlyphs == 0 &&
+          state.publishedFrameSerial > publishedAfter) {
+        return state;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 8));
+    }
+    return null;
+  }
+
+  Future<bool> waitForDfmFramePublished({
+    required int publishedAfter,
+    required Duration timeout,
+  }) async {
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      final state = await getDfmPrewarmState();
+      if (state == null) return false;
+      if (state.publishedFrameSerial > publishedAfter) return true;
+      await Future<void>.delayed(const Duration(milliseconds: 8));
+    }
+    return false;
   }
 
   Future<void> resetScene() async {
@@ -189,6 +268,10 @@ class DfmTextureBridge {
       'font_size_multiplier': item.content.fontSizeMultiplier,
       'is_me': item.content.isMe,
       'width': item.width * scaleX,
+      if (item.endMediaSeconds != null) ...{
+        'start_media_s': item.time,
+        'end_media_s': item.endMediaSeconds,
+      },
       // Mirror DfmEmojiPipeline._signedScrollSpeed so the fallback path
       // (framePayload == null) stays consistent with the production path.
       // playbackRate folds video speed into the velocity so native

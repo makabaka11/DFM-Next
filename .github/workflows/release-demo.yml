@@ -1,0 +1,181 @@
+name: Build and release DFM+ demo
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: '3.44.6'
+
+jobs:
+  android:
+    name: Android release APK
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+      - name: Build Android demo
+        working-directory: demo
+        run: |
+          flutter pub get
+          flutter build apk --release
+          cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/DFM-Plus-${GITHUB_REF_NAME}-Android.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-release
+          path: DFM-Plus-*-Android.apk
+          if-no-files-found: error
+
+  ios:
+    name: iOS release IPA
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - name: Use CocoaPods integration
+        run: flutter config --no-enable-swift-package-manager
+      - name: Build unsigned iOS demo
+        working-directory: demo
+        run: |
+          flutter pub get
+          flutter build ios --release --no-codesign
+          app_path="$(find build/ios/iphoneos -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app_path"
+          mkdir -p build/ios/package/Payload
+          cp -R "$app_path" build/ios/package/Payload/
+          (cd build/ios/package && zip -qry "$GITHUB_WORKSPACE/DFM-Plus-${GITHUB_REF_NAME}-iOS-unsigned.ipa" Payload)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-release
+          path: DFM-Plus-*-iOS-unsigned.ipa
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal release
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Use CocoaPods integration
+        run: flutter config --no-enable-swift-package-manager
+      - name: Build macOS demo
+        working-directory: demo
+        run: |
+          flutter pub get
+          flutter build macos --release
+          app_path="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app_path"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "$GITHUB_WORKSPACE/DFM-Plus-${GITHUB_REF_NAME}-macOS-universal.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: DFM-Plus-*-macOS-universal.zip
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64 release
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build Windows demo
+        working-directory: demo
+        shell: pwsh
+        run: |
+          flutter pub get
+          flutter build windows --release
+          Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "$env:GITHUB_WORKSPACE\DFM-Plus-$env:GITHUB_REF_NAME-Windows-x64.zip" -CompressionLevel Optimal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: DFM-Plus-*-Windows-x64.zip
+          if-no-files-found: error
+
+  linux:
+    name: Linux x64 release
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libepoxy-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Build Linux demo
+        working-directory: demo
+        run: |
+          flutter pub get
+          flutter build linux --release
+          tar -C build/linux/x64/release/bundle -czf "$GITHUB_WORKSPACE/DFM-Plus-${GITHUB_REF_NAME}-Linux-x64.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: DFM-Plus-*-Linux-x64.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [android, ios, macos, windows, linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --verify-tag \
+              --title "DFM+ $GITHUB_REF_NAME" \
+              --generate-notes
+          fi

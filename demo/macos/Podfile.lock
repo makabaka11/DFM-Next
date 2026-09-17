@@ -1,0 +1,22 @@
+PODS:
+  - dfm_plus_native (0.0.1):
+    - FlutterMacOS
+  - FlutterMacOS (1.0.0)
+
+DEPENDENCIES:
+  - dfm_plus_native (from `Flutter/ephemeral/.symlinks/plugins/dfm_plus_native/macos`)
+  - FlutterMacOS (from `Flutter/ephemeral`)
+
+EXTERNAL SOURCES:
+  dfm_plus_native:
+    :path: Flutter/ephemeral/.symlinks/plugins/dfm_plus_native/macos
+  FlutterMacOS:
+    :path: Flutter/ephemeral
+
+SPEC CHECKSUMS:
+  dfm_plus_native: a5b1320fe4ab23f1436f54bde2220ef4793548aa
+  FlutterMacOS: d0db08ddef1a9af05a5ec4b724367152bb0500b1
+
+PODFILE CHECKSUM: 346bfb2deb41d4a6ebd6f6799f92188bde2d246f
+
+COCOAPODS: 1.16.2

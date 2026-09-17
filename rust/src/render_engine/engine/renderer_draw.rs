@@ -423,6 +423,15 @@ impl DfmRenderer {
     /// build_vertices, guaranteeing we stop re-rendering exactly when motion
     /// would freeze anyway.
     fn needs_interpolation_render(&self) -> bool {
+        if self.motion_mode == MotionMode::ContinuousAnchor {
+            // Include future/static items: their activation and expiration also
+            // need to proceed while Dart is unavailable. One last draw clears
+            // the scene when the delivered lookahead is exhausted.
+            return self.motion_clock.playing && !self.frame_items.is_empty();
+        }
+        if self.motion_mode == MotionMode::VsyncSnapshot {
+            return false;
+        }
         // Submit-rate adaptive gate. Only fill between submissions when Dart
         // feeds slower than our 16ms tick (~30fps submit). When Dart sustains
         // ~1 submit/tick (ema <= 20ms, healthy 60fps), idle interp is
@@ -456,8 +465,20 @@ impl DfmRenderer {
         // arrives for >50ms (pause / upstream stall) dt clamps to 0, freezing
         // motion on the last submission without needing a pause command.
         let elapsed = self.submit_instant.elapsed().as_secs_f32();
-        self.interp_dt = if elapsed < 0.050 { elapsed } else { 0.0 };
+        self.interp_dt = if self.motion_mode == MotionMode::LegacyInterpolation
+            && elapsed < 0.050
+        {
+            elapsed
+        } else {
+            0.0
+        };
         let interp_dt = self.interp_dt as f64;
+        let continuous = self.motion_mode == MotionMode::ContinuousAnchor;
+        let motion_now = std::time::Instant::now();
+        let media = self.motion_clock.media_at(motion_now);
+        if continuous && self.motion_clock.playing && !self.motion_clock.active(motion_now) {
+            self.frame_items.clear();
+        }
 
         // Take `frame_items` out of `self` so the loop body can borrow `self`
         // mutably (push_quad / push_shadow_quad / atlas.entry_for all need
@@ -466,7 +487,14 @@ impl DfmRenderer {
         // Vec plus every token's String on every frame.
         let frame_items = std::mem::take(&mut self.frame_items);
         for item in &frame_items {
-            let outline_px = resolve_outline_px(item.font_size, item.outline_width);
+            let x = if continuous {
+                let Some(x) = motion::sample_x(item.x, item.scroll_speed as f64,
+                    self.motion_clock.snapshot_media, media, item.start_media_s, item.end_media_s)
+                    else { continue; };
+                x
+            } else { item.x + item.scroll_speed as f64 * interp_dt };
+            let outline_px =
+                super::resolve_danmaku_outline_px(item.font_size, item.outline_width);
             let shadow = resolve_shadow(item.font_size, item.shadow_style);
             let fill_color = argb_to_linear(item.color_argb, item.opacity);
             let outline_color = stroke_color(fill_color);
@@ -477,11 +505,11 @@ impl DfmRenderer {
                 shadow.opacity * item.opacity * SHADOW_ALPHA_SCALE,
             ];
 
-            let mut cursor_x = (item.x + item.scroll_speed as f64 * interp_dt) as f32;
+            let mut cursor_x = x as f32;
+            let item_left = cursor_x;
             let quantized_size = item.font_size.round().clamp(8.0, 256.0) as u32;
             let baseline_y = item.y as f32 + self.atlas.line_ascent(quantized_size);
             let tokens = &item.tokens;
-            let item_left = cursor_x;
             let mut visual_bounds: Option<RenderBounds> = None;
 
             for token in tokens {
@@ -505,8 +533,11 @@ impl DfmRenderer {
                             let glyph_top = baseline_y + entry.offset_y;
                             let glyph_right = glyph_left + entry.width as f32;
                             let glyph_bottom = glyph_top + entry.height as f32;
-
                             if item.is_me {
+                                // The MSDF quad contains `spread` pixels of transparent
+                                // distance-field margin. Exclude that margin (while
+                                // retaining outline + AA coverage) so the self marker
+                                // follows the visible glyph instead of its atlas cell.
                                 let visible_inset = (entry.spread - outline_px - 1.0).max(0.0);
                                 include_render_bounds(
                                     &mut visual_bounds,
@@ -564,6 +595,9 @@ impl DfmRenderer {
                         let glyph_bottom = glyph_top + entry.height as f32;
 
                         if item.is_me {
+                            // Emoji bitmaps are generated with symmetric transparent
+                            // padding. Recover the painted content box from the stored
+                            // advance/font size, then retain only the outline margin.
                             let horizontal_padding =
                                 ((entry.width as f32 - entry.advance.max(0.0)) * 0.5).max(0.0);
                             let vertical_padding =
@@ -612,6 +646,8 @@ impl DfmRenderer {
                         cursor_x += entry.advance.max(1.0) + side_bearing * 2.0;
                     }
                 }
+            }
+
             if item.is_me {
                 if let Some(marker) = resolve_self_marker_bounds(
                     item_left,
@@ -621,37 +657,72 @@ impl DfmRenderer {
                     item.font_size,
                     visual_bounds,
                 ) {
+                    // Scale in texture pixels so high-DPI/supersampled surfaces
+                    // retain a clearly visible ~2 logical-pixel border.
                     let stroke = self_marker_stroke(item.font_size);
                     let left = marker.left;
                     let top = marker.top;
                     let right = marker.right;
                     let bottom = marker.bottom;
+                    // Chroma-key green keeps locally-sent danmaku immediately
+                    // recognizable against both light and dark video frames.
                     let color = [0.0, 1.0, 0.0, item.opacity];
                     let params = [1.0, 0.0, GLYPH_MODE_SOLID, 0.0];
                     let uv = [0.0, 0.0];
 
                     self.push_quad(
-                        left, top, right, top + stroke,
-                        uv, uv, uv, uv,
-                        color, color, params,
+                        left,
+                        top,
+                        right,
+                        top + stroke,
+                        uv,
+                        uv,
+                        uv,
+                        uv,
+                        color,
+                        color,
+                        params,
                     );
                     self.push_quad(
-                        left, bottom - stroke, right, bottom,
-                        uv, uv, uv, uv,
-                        color, color, params,
+                        left,
+                        bottom - stroke,
+                        right,
+                        bottom,
+                        uv,
+                        uv,
+                        uv,
+                        uv,
+                        color,
+                        color,
+                        params,
                     );
                     self.push_quad(
-                        left, top + stroke, left + stroke, bottom - stroke,
-                        uv, uv, uv, uv,
-                        color, color, params,
+                        left,
+                        top + stroke,
+                        left + stroke,
+                        bottom - stroke,
+                        uv,
+                        uv,
+                        uv,
+                        uv,
+                        color,
+                        color,
+                        params,
                     );
                     self.push_quad(
-                        right - stroke, top + stroke, right, bottom - stroke,
-                        uv, uv, uv, uv,
-                        color, color, params,
+                        right - stroke,
+                        top + stroke,
+                        right,
+                        bottom - stroke,
+                        uv,
+                        uv,
+                        uv,
+                        uv,
+                        color,
+                        color,
+                        params,
                     );
                 }
-            }
             }
         }
 
@@ -866,6 +937,11 @@ fn self_marker_stroke(font_size: f32) -> f32 {
     (font_size * 0.08).clamp(2.5, 5.0)
 }
 
+/// Builds a self-send marker from the same glyph/emoji bounds used for GPU
+/// drawing. The collision width is only a fallback: it includes layout-only
+/// outline expansion and using it for a normal rendered item biases the box to
+/// the right. Vertically, center a minimum one-em box on the actual painted
+/// content so Emoji baseline padding cannot pull the marker upward.
 fn resolve_self_marker_bounds(
     item_left: f32,
     cursor_x: f32,
@@ -937,17 +1013,6 @@ fn to_ndc(x: f32, y: f32, width: f32, height: f32) -> [f32; 2] {
     let nx = (x / width) * 2.0 - 1.0;
     let ny = 1.0 - (y / height) * 2.0;
     [nx, ny]
-}
-
-fn resolve_outline_px(font_size: f32, width_multiplier: f32) -> f32 {
-    if !width_multiplier.is_finite() {
-        return 0.0;
-    }
-    let width_multiplier = width_multiplier.clamp(0.0, 4.0);
-    if width_multiplier <= 0.0 {
-        return 0.0;
-    }
-    (font_size * 0.06).clamp(1.0, 2.6) * width_multiplier
 }
 
 #[derive(Copy, Clone)]
@@ -1141,6 +1206,123 @@ fn intersection_1d(f: &[f32], i: usize, j: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_marker_centers_on_visible_content_and_uses_real_advance() {
+        let marker = resolve_self_marker_bounds(
+            10.0,
+            70.0,
+            100.0,
+            0.0,
+            30.0,
+            Some(RenderBounds {
+                left: 12.0,
+                top: 20.0,
+                right: 68.0,
+                bottom: 50.0,
+            }),
+        )
+        .expect("marker bounds");
+
+        // 30px font → 4px padding. The 100px collision fallback must not
+        // stretch a normally rendered 60px item to the right.
+        assert_eq!(marker.left, 6.0);
+        assert_eq!(marker.right, 74.0);
+        assert_eq!((marker.top + marker.bottom) * 0.5, 35.0);
+        assert_eq!(marker.bottom - marker.top, 38.0);
+    }
+
+    #[test]
+    fn self_marker_stroke_scales_for_supersampled_textures() {
+        assert_eq!(self_marker_stroke(24.0), 2.5);
+        assert_eq!(self_marker_stroke(50.0), 4.0);
+        assert_eq!(self_marker_stroke(100.0), 5.0);
+    }
+
+    #[test]
+    fn narrow_latin_glyphs_keep_their_font_advance() {
+        let fonts = load_font_chain(None).expect("load test fonts");
+        let face = fonts
+            .iter()
+            .find_map(|font| font.face.glyph_index('j').map(|id| (&font.face, id)))
+            .expect("test font contains j");
+        let px = 50.0_f32;
+        let expected = scale_metric_to_px(
+            face.0
+                .glyph_hor_advance(face.1)
+                .expect("j has a horizontal advance") as f32,
+            face.0,
+            px,
+        );
+        let actual = glyph_advance_px(face.0, face.1, px);
+
+        assert!((actual - expected).abs() < f32::EPSILON);
+        assert!(
+            actual < px * FALLBACK_GLYPH_ADVANCE_RATIO,
+            "j advance {actual} was expanded to the fallback cell width"
+        );
+    }
+
+    #[test]
+    fn parallel_msdf_generation_matches_serial_generation() {
+        let fonts = std::sync::Arc::new(load_font_chain(None).expect("load test fonts"));
+        let cases = [('医', 50.0_f32), ('院', 50.0_f32), ('弹', 36.0_f32), ('幕', 36.0_f32)];
+
+        let serial: Vec<_> = cases
+            .iter()
+            .map(|&(ch, px)| rasterize_glyph_on_face(fonts.as_slice(), ch, px).unwrap())
+            .collect();
+        let workers: Vec<_> = cases
+            .iter()
+            .map(|&(ch, px)| {
+                let fonts = std::sync::Arc::clone(&fonts);
+                std::thread::spawn(move || {
+                    rasterize_glyph_on_face(fonts.as_slice(), ch, px).unwrap()
+                })
+            })
+            .collect();
+        let parallel: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("MSDF worker panicked"))
+            .collect();
+
+        for (serial, parallel) in serial.iter().zip(parallel.iter()) {
+            assert_eq!(parallel.width, serial.width);
+            assert_eq!(parallel.height, serial.height);
+            assert_eq!(parallel.pixels, serial.pixels);
+        }
+    }
+
+    #[test]
+    fn thick_outline_keeps_the_mtsdf_quad_border_transparent() {
+        let fonts = load_font_chain(None).expect("load test fonts");
+        let glyph = rasterize_glyph_on_face(fonts.as_slice(), '医', 50.0)
+            .expect("rasterize test glyph");
+        let outline_px = crate::render_engine::resolve_danmaku_outline_px(256.0, 2.0);
+        let antialias_px = 1.0_f32;
+
+        let border_alpha = (0..glyph.width)
+            .flat_map(|x| [(x, 0), (x, glyph.height - 1)])
+            .chain((0..glyph.height).flat_map(|y| [(0, y), (glyph.width - 1, y)]));
+        for (x, y) in border_alpha {
+            let alpha = glyph.pixels[((y * glyph.width + x) * 4 + 3) as usize] as f32 / 255.0;
+            let distance = (alpha - 0.5) * glyph.spread;
+            let coverage = smoothstep_for_test(
+                -outline_px - antialias_px,
+                -outline_px + antialias_px,
+                distance,
+            );
+            assert!(
+                coverage <= 0.0001,
+                "quad border became visible at ({x}, {y}): distance={distance}, coverage={coverage}"
+            );
+        }
+    }
+
+    fn smoothstep_for_test(edge0: f32, edge1: f32, value: f32) -> f32 {
+        let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
 
     #[test]
     fn emoji_sdf_mask_keeps_inside_above_midpoint() {

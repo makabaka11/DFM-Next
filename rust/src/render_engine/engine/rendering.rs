@@ -922,6 +922,10 @@ impl DfmGlyphAtlas {
         self.msdf_worker.submit_async(ch, quantized_size);
     }
 
+    fn pending_prefetch_count(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Drain completed async prefetch results and upload them to the atlas.
     /// Called on the render thread at the top of each engine loop iteration.
     /// Returns the number of results processed.
@@ -977,10 +981,10 @@ fn load_font_chain(custom_font: Option<FontSource>) -> Result<Vec<FontFaceHandle
         let _ = load_faces_from_owned_bytes(boxed, &mut seen, &mut fonts)?;
     }
 
-    let primary_bytes = crate::render_engine::DEFAULT_FONT_DATA.to_vec().into_boxed_slice();
+    let primary_bytes = super::DEFAULT_FONT_DATA.to_vec().into_boxed_slice();
     load_faces_from_owned_bytes(primary_bytes, &mut seen, &mut fonts)?;
 
-    for bytes in crate::render_engine::FALLBACK_FONT_DATA {
+    for bytes in super::FALLBACK_FONT_DATA {
         let boxed = (*bytes).to_vec().into_boxed_slice();
         let _ = load_faces_from_owned_bytes(boxed, &mut seen, &mut fonts);
     }
@@ -1198,6 +1202,10 @@ struct DfmRenderer {
     /// double-rendering phase jitter (visible as 时快时慢 speed variation).
     /// Enabled only when Dart feeds slower than the tick (~30fps submit).
     submit_interval_ema: f32,
+    /// DFM+ submits absolute coordinates sampled on Flutter's vsync. In that
+    /// mode native wall-clock interpolation would introduce a second clock.
+    motion_mode: MotionMode,
+    motion_clock: motion::MotionClock,
     width: u32,
     height: u32,
     shadow_mask_texture: wgpu::Texture,

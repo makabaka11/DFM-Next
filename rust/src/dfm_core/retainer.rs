@@ -1,5 +1,5 @@
 /// Track-based collision avoidance layout engine.
-/// Inspired by Next2's track + compaction approach for correct pre-computed layout.
+/// Inspired by DFM renderer's track + compaction approach for correct pre-computed layout.
 ///
 /// Key design: per-type track arrays storing lightweight collision records,
 /// compact expired items before each placement, assign to first non-colliding track,
@@ -63,7 +63,7 @@ impl TrackData {
 
     /// Compact expired entries from a track.
     /// DFM original keeps entries for start+2*duration, which is unnecessarily long.
-    /// We match Next2's approach: an entry is expired when its full duration has elapsed
+    /// We match DFM renderer's approach: an entry is expired when its full duration has elapsed
     /// since it started (i.e., it has scrolled completely off screen).
     fn compact(&mut self, current_time_ms: i64, _current_duration_ms: i64) {
         if current_time_ms == self.last_compact_ms {
@@ -348,7 +348,7 @@ fn entry_right_edge_at(entry: &TrackEntry, time_ms: i64, view_width: f32) -> f32
 /// Unlike scroll tracks which compact based on time windows, fixed tracks chain items
 /// sequentially (each starts when the previous ends). This removes items from the front
 /// of each track's chain whose end time has passed, freeing tracks for new items.
-/// Mirrors Next2's `compact_static_tracks` (which clears entire tracks when the item ends).
+/// Mirrors DFM renderer's `compact_static_tracks` (which clears entire tracks when the item ends).
 fn compact_fixed_tracks(tracks: &mut [Vec<TrackEntry>], current_time_ms: i64) {
     for track in tracks.iter_mut() {
         // Remove all entries from the front that have fully expired.
@@ -740,7 +740,7 @@ mod tests {
         let (placed0, _) = retainer.fix(&mut items[0], 1920.0, 60.0, &flags, 1.0, false);
         assert!(placed0, "first item should be placed in the only track");
 
-        // Second item: track still occupied → dropped (Next2 behavior).
+        // Second item: track still occupied → dropped (DFM behavior).
         let (placed1, _) = retainer.fix(&mut items[1], 1920.0, 60.0, &flags, 1.0, false);
         assert!(
             !placed1,
@@ -812,7 +812,7 @@ mod tests {
             .collect();
 
         // Only one track fits (view_height=60, track_height=45).
-        // First item gets placed; subsequent items are dropped (Next2 behavior).
+        // First item gets placed; subsequent items are dropped (DFM behavior).
         for i in 0..items.len() {
             items[i].index = i as u32;
             let (placed, _) = retainer.fix(&mut items[i], 1920.0, 60.0, &flags, 1.0, false);

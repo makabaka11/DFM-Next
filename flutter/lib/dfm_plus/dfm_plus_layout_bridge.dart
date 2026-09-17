@@ -4,16 +4,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'danmaku_types.dart';
 
-// TODO: 需要通过 flutter_rust_bridge 生成 Rust API 绑定到 dfm_plus_api.dart
-// 原始导入: import 'package:nipaplay/src/rust/api/dfm_plus.dart' as rust_dfm;
-// 生成后请将此行替换为: import 'dfm_plus_api.dart' as rust_dfm;
 import 'dfm_plus_api.dart' as rust_dfm;
 import 'dfm_emoji_pipeline.dart';
-
-// TODO: 需要确保 Rust 初始化后再调用布局方法
-// 原始导入: import 'package:nipaplay/src/rust/rust_init.dart';
-// 原始调用: await ensureRustInitialized();
-// 请在集成时确保 Rust 运行时已初始化
 
 class DfmPlusLayoutBridge {
   rust_dfm.DfmPlusPreparedLayout? _prepared;
@@ -58,6 +50,7 @@ class DfmPlusLayoutBridge {
   /// items on the next frame (one cheap Color/object allocation each).
   int _lastPruneTimestampMs = 0;
   static const int _pruneIntervalMs = 30000;
+  final Stopwatch _pruneClock = Stopwatch()..start();
 
   Future<void> configure({
     required List<Map<String, dynamic>> danmakuList,
@@ -171,8 +164,6 @@ class DfmPlusLayoutBridge {
       widthPlans.add(parts);
     }
 
-    // TODO: 确保 Rust 运行时已初始化后再调用
-    // await ensureRustInitialized();
     final List<double> plainWidths = plainRuns.isEmpty
         ? const <double>[]
         : await rust_dfm.dfmPlusMeasureTextWidths(
@@ -247,7 +238,8 @@ class DfmPlusLayoutBridge {
   /// binary search for visible window + per-item x/y computation.
   /// Object reuse: PositionedDanmakuItem and DanmakuContentItem are cached
   /// and mutated in-place, avoiding per-frame allocation and GC pressure.
-  List<PositionedDanmakuItem> layout(double currentTimeSeconds) {
+  List<PositionedDanmakuItem> layout(double currentTimeSeconds,
+      {double lookaheadSeconds = 0.0}) {
     final prepared = _prepared;
     if (prepared == null) {
       return const [];
@@ -262,13 +254,14 @@ class DfmPlusLayoutBridge {
 
     final windowStart = currentTimeSeconds - maxDur;
     final startIdx = _lowerBound(itemTimes, windowStart);
-    final endIdx = _upperBound(itemTimes, currentTimeSeconds);
+    final endIdx =
+        _upperBound(itemTimes, currentTimeSeconds + lookaheadSeconds);
 
     // Soft-prune caches that drifted beyond the visible window on long
     // videos. Clears only when caches hold far more than the current
     // window AND at least 30s since the last prune — putIfAbsent rebuilds
     // visible items next frame, so this is invisible to the user.
-    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final nowMs = _pruneClock.elapsedMilliseconds;
     if (nowMs - _lastPruneTimestampMs >= _pruneIntervalMs) {
       _lastPruneTimestampMs = nowMs;
       final windowSize = endIdx - startIdx;
@@ -285,9 +278,9 @@ class DfmPlusLayoutBridge {
     for (int i = startIdx; i < endIdx; i++) {
       final pi = items[i];
       final elapsed = currentTimeSeconds - pi.timeSeconds;
-      if (elapsed < 0.0) continue;
+      if (elapsed < -lookaheadSeconds) continue;
 
-      if (!pi.isScroll && elapsed > pi.durationSeconds) continue;
+      if (elapsed > pi.durationSeconds) continue;
 
       double x;
       double offstageX;
@@ -308,31 +301,38 @@ class DfmPlusLayoutBridge {
         offstageX = width;
       }
 
-      if (pi.isScroll && x < -pi.width) continue;
+      if (pi.isScroll &&
+          elapsed >= 0.0 &&
+          (pi.typeCode == 6 ? x > width : x < -pi.width)) continue;
       if (pi.yPosition < 0.0) continue;
 
       // Reuse DanmakuContentItem from cache (avoids Color() allocation)
-      final content = _contentCache.putIfAbsent(i, () => DanmakuContentItem(
-        pi.text,
-        type: _toItemType(pi.typeCode),
-        color: Color(pi.colorArgb),
-        isMe: pi.isMe,
-        fontSizeMultiplier: pi.fontSizeMultiplier,
-        countText: pi.countText,
-      ));
+      final content = _contentCache.putIfAbsent(
+          i,
+          () => DanmakuContentItem(
+                pi.text,
+                type: _toItemType(pi.typeCode),
+                color: Color(pi.colorArgb),
+                isMe: pi.isMe,
+                fontSizeMultiplier: pi.fontSizeMultiplier,
+                countText: pi.countText,
+              ));
 
       // Reuse PositionedDanmakuItem from cache (preserves displayX across frames
       // for wall-clock incremental positioning).
-      final positioned = _positionedCache.putIfAbsent(i, () => PositionedDanmakuItem(
-        content: content,
-        x: x,
-        y: pi.yPosition,
-        offstageX: offstageX,
-        time: pi.timeSeconds,
-        scrollSpeed: pi.isScroll ? pi.scrollSpeed : 0.0,
-        width: pi.width,
-        typeCode: pi.typeCode,
-      ));
+      final positioned = _positionedCache.putIfAbsent(
+          i,
+          () => PositionedDanmakuItem(
+                content: content,
+                x: x,
+                y: pi.yPosition,
+                offstageX: offstageX,
+                time: pi.timeSeconds,
+                endMediaSeconds: pi.timeSeconds + pi.durationSeconds,
+                scrollSpeed: pi.isScroll ? pi.scrollSpeed : 0.0,
+                width: pi.width,
+                typeCode: pi.typeCode,
+              ));
 
       // Update mutable fields from fresh absolute-position computation.
       // displayX is intentionally NOT overwritten — it is managed by the

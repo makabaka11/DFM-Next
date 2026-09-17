@@ -1,5 +1,5 @@
 [package]
-name = "dfm-plus"
+name = "dfm_plus"
 version = "0.1.0"
 edition = "2021"
 description = "DFM+ danmaku engine — a Rust port of Bilibili's DanmakuFlameMaster layout algorithms with native GPU rendering"

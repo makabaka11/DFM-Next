@@ -1,2 +1,65 @@
+# Operating system and editors
 .DS_Store
-.claude
+Thumbs.db
+.claude/
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+*.swp
+
+# Dart and Flutter caches
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+**/.pub-cache/
+**/.pub/
+**/build/
+**/coverage/
+**/doc/api/
+
+# Generated Flutter platform state
+**/Flutter/.last_build_id
+**/Flutter/ephemeral/
+**/Flutter/Generated.xcconfig
+**/Flutter/flutter_export_environment.sh
+**/Runner/GeneratedPluginRegistrant.*
+**/flutter/ephemeral/
+**/Pods/
+**/.symlinks/
+**/DerivedData/
+**/xcuserdata/
+
+# Android local state
+**/.gradle/
+**/.cxx/
+**/captures/
+**/local.properties
+**/key.properties
+**/*.keystore
+**/*.jks
+
+# Rust build output
+**/target/
+**/*.rs.bk
+
+# Packaged release artifacts
+*.apk
+*.aab
+*.ipa
+*.msix
+*.dmg
+*.deb
+*.rpm
+*.AppImage
+*.zip
+*.tar.gz
+*.dSYM
+*.symbols
+*.map.json
+
+# Package lock files for reusable library packages
+flutter/pubspec.lock
+native_plugin/pubspec.lock

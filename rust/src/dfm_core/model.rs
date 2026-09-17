@@ -275,7 +275,7 @@ impl DanmakuItem {
     }
 
     /// Measure the danmaku dimensions based on text content.
-    /// Uses a heuristic similar to Next2's measure_text_width.
+    /// Uses a heuristic similar to DFM renderer's measure_text_width.
     /// `outline_width` is added to paint_width to account for text outline rendering.
     pub fn measure(&mut self, view_width: f32, _view_height: f32, global_flags: &GlobalFlags) {
         self.measure_with_outline(view_width, _view_height, global_flags, 0.0);
@@ -388,7 +388,7 @@ impl DanmakuItem {
 }
 
 /// Heuristic text width measurement.
-/// Ported from Next2's measure_text_width: CJK=1.0em, ASCII=0.55em, whitespace=0.35em.
+/// Ported from DFM renderer's measure_text_width: CJK=1.0em, ASCII=0.55em, whitespace=0.35em.
 pub fn measure_text_width(text: &str, font_size: f32) -> f32 {
     let mut width = 0.0f32;
     for ch in text.chars() {

@@ -23,8 +23,8 @@ Rust 渲染引擎需要以 cdylib 方式编译并放入 Flutter 的 native asset
 
 ```dart
 import 'package:flutter/material.dart';
-import 'package:dfm_plus/dfm_plus_overlay.dart';
-import 'package:dfm_plus/danmaku_types.dart';
+import 'package:dfm_plus/dfm_plus/dfm_plus_overlay.dart';
+import 'package:dfm_plus/dfm_plus/danmaku_types.dart';
 
 void main() => runApp(const DemoApp());
 
@@ -292,7 +292,7 @@ class _DanmakuDemoPageState extends State<DanmakuDemoPage> {
 
 ```
 DFM+/
-├── rust/                              # Rust 层（crate: dfm-plus）
+├── rust/                              # Rust 层（crate: dfm_plus）
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs                     # crate 入口
@@ -306,12 +306,17 @@ DFM+/
 │       │   └── timer.rs               # 自适应帧率计时器
 │       ├── api/
 │       │   └── dfm_plus.rs            # 公共 API (prepare_layout + layout_frame)
+│       ├── dart_ffi.rs                # Dart 到 Rust 的 JSON FFI 边界
 │       └── render_engine/             # GPU 渲染引擎
 │           ├── mod.rs                 # 引擎入口 (include + 模块声明)
+│           ├── engine.rs              # 渲染队列、运动时钟与绘制模块入口
 │           ├── ffi.rs                 # C FFI 绑定
 │           ├── present.rs             # 平台呈现目标
 │           └── engine/
 │               ├── runtime.rs         # 设备上下文、引擎注册表
+│               ├── motion.rs          # 媒体时钟与原生 vsync 帧节奏
+│               ├── command_channel.rs # 可中断的渲染命令队列
+│               ├── frame_completion.rs # GPU 提交完成跟踪
 │               ├── rendering.rs       # 字形图集、MSDF 栅格化
 │               ├── renderer_core.rs   # 渲染器核心 (update_frame, draw)
 │               ├── renderer_draw.rs   # build_vertices, 插值门控
@@ -325,9 +330,15 @@ DFM+/
 │       ├── dfm_plus_overlay.dart      # DfmPlusOverlay Widget
 │       ├── dfm_plus_layout_bridge.dart # 布局桥接 (增量配置 + 同步帧计算)
 │       ├── dfm_texture_bridge.dart    # GPU 纹理桥接 (MethodChannel)
+│       ├── dfm_native_vsync.dart      # 原生 vsync FFI 桥接
 │       ├── dfm_emoji_pipeline.dart    # Emoji 栅格化管线
 │       ├── dfm_platform_support.dart  # 平台支持检测
-│       └── dfm_plus_api.dart          # Rust API 类型定义
+│       └── dfm_plus_api.dart          # Rust API 数据类型与实际 FFI 调用
+│
+├── native_plugin/                    # 五个平台的原生纹理注册与 Rust 打包
+├── demo/                             # 五分钟伪播放器演示应用
+│   ├── lib/main.dart
+│   └── lib/demo_danmaku.dart
 │
 └── README.md
 ```
@@ -342,7 +353,7 @@ DFM+/
 | `displayArea` | double | 1.0 | 显示区域占画面高度比例 (0.1~1.0) |
 | `scrollDurationSeconds` | double | 5.0 | 滚动弹幕通过屏幕的时间 |
 | `trackGapRatio` | double | 0.15 | 轨道间距 = 弹幕高度 × 该比例 |
-| `outlineWidth` | double | 0.0 | 文字描边宽度 (0.0~4.0) |
+| `outlineWidth` | double | 0.0 | 描边档位：0=关闭，1=细，2=粗 |
 | `allowStacking` | bool | false | 允许弹幕堆叠（关闭碰撞避让） |
 | `mergeDanmaku` | bool | false | 合并重复弹幕为 "xN" |
 | `maxQuantity` | int? | null | 最大同屏弹幕数 |
@@ -356,16 +367,33 @@ DFM+/
 
 ## 构建
 
+独立版的 GPU 渲染层现在导出 `dfm_engine_*` C 符号。接入 Flutter
+`dfm_plus/texture` MethodChannel 的平台插件时，`getTextureInfo`、
+`setFrame`、`disposeTexture` 需要使用这些符号；在非 Linux 平台，
+Flutter 通过 `DfmNativeVsync` 直接把 `elapsedUs` 传给
+`dfm_engine_vsync`。启动预热状态查询
+`getDfmPrewarmState` 可用 `dfm_engine_prefetch_pending` 和
+`dfm_engine_published_frame_serial` 实现。
+Flutter 覆盖层可通过 `startupGateToken` 和 `onStartupReady` 等待首屏
+预热及第一帧完成；平台插件必须提供上述预热状态查询才会触发回调。
+新的连续运动帧包含 `motion_mode: continuous_anchor`、`motion_clock`
+以及每条弹幕的 `start_media_s` / `end_media_s`；原生引擎仍支持旧帧格式。
+
+本仓库还包含 `native_plugin/`，它为 Android、iOS、macOS、Windows 和
+Linux 注册 `dfm_plus/texture` 通道，并通过 Cargokit 构建 Rust 库。
+`demo/` 是可直接构建的五分钟原生 GPU 演示应用，操作和 release 构建命令
+见 [demo/README.md](demo/README.md)。
+
 ```bash
 # Rust 层
 cd rust
-cargo build
-cargo test   # 55+ 单元测试
+cargo build --release
+cargo test --release   # Rust 单元测试
 
 # Flutter 层
 cd flutter
 flutter pub get
-flutter run
+dart analyze lib
 ```
 
 ---

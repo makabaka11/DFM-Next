@@ -56,6 +56,9 @@ class PositionedDanmakuItem {
   double offstageX;
   final double time;
 
+  /// Media time when the native continuous renderer must stop this item.
+  final double? endMediaSeconds;
+
   /// 滚动弹幕的水平移动速度（像素/秒）。
   /// Painter 利用此值做增量定位，避免绝对位置计算在倍速下因帧间隔
   /// 抖动而产生视觉跳跃。非滚动弹幕此值为 0。
@@ -81,6 +84,7 @@ class PositionedDanmakuItem {
     required this.y,
     required this.offstageX,
     required this.time,
+    this.endMediaSeconds,
     this.scrollSpeed = 0.0,
     this.width = 0.0,
     this.typeCode = 0,

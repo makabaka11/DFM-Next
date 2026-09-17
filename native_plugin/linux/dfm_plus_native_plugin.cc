@@ -1,0 +1,632 @@
+#include "include/dfm_plus_native/dfm_plus_native_plugin.h"
+
+#include <flutter_linux/flutter_linux.h>
+#include <epoxy/egl.h>
+#include <epoxy/gl.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+extern "C" {
+typedef const void* (*DfmGlProcLoader)(const char* name);
+
+uint64_t dfm_engine_create(uint32_t width, uint32_t height);
+uint8_t dfm_engine_resize(uint64_t handle, uint32_t width, uint32_t height);
+void dfm_engine_dispose(uint64_t handle);
+bool dfm_engine_poll_frame_ready(uint64_t handle);
+uint8_t dfm_engine_render_gl_texture(uint64_t handle,
+                                       uint32_t texture_name,
+                                       uint32_t width,
+                                       uint32_t height,
+                                       DfmGlProcLoader loader);
+uint8_t dfm_engine_set_frame(uint64_t handle,
+                               const char* frame_json,
+                               float font_size,
+                               float outline_width,
+                               uint8_t shadow_style,
+                               float opacity,
+                               const char* custom_font_family,
+                               const char* custom_font_file_path);
+uint8_t dfm_engine_reset_scene(uint64_t handle);
+}
+
+#define DFM_PLUS_NATIVE_PLUGIN(obj)                                      \
+  (G_TYPE_CHECK_INSTANCE_CAST((obj), dfm_plus_native_plugin_get_type(), \
+                              DfmPlusNativePlugin))
+
+constexpr char kChannelName[] = "dfm_plus/texture";
+constexpr int kMaxDimension = 16384;
+constexpr int kFallbackSize = 512;
+
+struct SurfaceState;
+using SurfaceMap = std::unordered_map<std::string, std::shared_ptr<SurfaceState>>;
+using SurfaceMutex = std::mutex;
+
+struct SurfaceState {
+  std::string surface_id;
+  FlTextureGL* texture = nullptr;
+  FlTexture* texture_base = nullptr;
+  int64_t texture_id = -1;
+  uint64_t engine_handle = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  std::mutex lock;
+  bool disposed = false;
+};
+
+typedef struct _DfmGLTexture DfmGLTexture;
+typedef struct _DfmGLTextureClass DfmGLTextureClass;
+
+struct _DfmGLTexture {
+  FlTextureGL parent_instance;
+  std::shared_ptr<SurfaceState>* state = nullptr;
+  GdkGLContext* gl_context = nullptr;
+  GLuint texture_name = 0;
+  uint32_t texture_width = 0;
+  uint32_t texture_height = 0;
+};
+
+struct _DfmGLTextureClass {
+  FlTextureGLClass parent_class;
+};
+
+G_DEFINE_TYPE(DfmGLTexture, dfm_gl_texture, fl_texture_gl_get_type())
+
+struct _DfmPlusNativePlugin {
+  GObject parent_instance;
+  FlMethodChannel* channel;
+  FlPluginRegistrar* registrar;
+  FlTextureRegistrar* texture_registrar;
+  SurfaceMap surfaces;
+  SurfaceMutex surfaces_lock;
+  guint tick_source = 0;
+};
+
+G_DEFINE_TYPE(DfmPlusNativePlugin,
+              dfm_plus_native_plugin,
+              g_object_get_type())
+
+static std::optional<int64_t> ToInt64(FlValue* value) {
+  if (value == nullptr) {
+    return std::nullopt;
+  }
+  if (fl_value_get_type(value) == FL_VALUE_TYPE_INT) {
+    return fl_value_get_int(value);
+  }
+  if (fl_value_get_type(value) == FL_VALUE_TYPE_FLOAT) {
+    return static_cast<int64_t>(fl_value_get_float(value));
+  }
+  if (fl_value_get_type(value) == FL_VALUE_TYPE_STRING) {
+    const gchar* text = fl_value_get_string(value);
+    if (text == nullptr) {
+      return std::nullopt;
+    }
+    gchar* endptr = nullptr;
+    const gint64 parsed = g_ascii_strtoll(text, &endptr, 10);
+    if (endptr == text) {
+      return std::nullopt;
+    }
+    return parsed;
+  }
+  return std::nullopt;
+}
+
+static int ReadClampedInt(FlValue* map,
+                          const char* key,
+                          int fallback,
+                          int min_value,
+                          int max_value) {
+  FlValue* v = fl_value_lookup_string(map, key);
+  auto parsed = ToInt64(v);
+  if (!parsed.has_value()) {
+    return std::clamp(fallback, min_value, max_value);
+  }
+  return std::clamp(static_cast<int>(*parsed), min_value, max_value);
+}
+
+static uint64_t ReadU64(FlValue* map, const char* key, uint64_t fallback = 0) {
+  FlValue* v = fl_value_lookup_string(map, key);
+  auto parsed = ToInt64(v);
+  if (!parsed.has_value() || *parsed <= 0) {
+    return fallback;
+  }
+  return static_cast<uint64_t>(*parsed);
+}
+
+static float ReadFloat(FlValue* map, const char* key, float fallback) {
+  FlValue* v = fl_value_lookup_string(map, key);
+  if (v == nullptr) {
+    return fallback;
+  }
+  if (fl_value_get_type(v) == FL_VALUE_TYPE_FLOAT) {
+    return static_cast<float>(fl_value_get_float(v));
+  }
+  if (fl_value_get_type(v) == FL_VALUE_TYPE_INT) {
+    return static_cast<float>(fl_value_get_int(v));
+  }
+  return fallback;
+}
+
+static uint8_t ReadU8(FlValue* map, const char* key, uint8_t fallback) {
+  FlValue* v = fl_value_lookup_string(map, key);
+  auto parsed = ToInt64(v);
+  if (!parsed.has_value()) {
+    return fallback;
+  }
+  return static_cast<uint8_t>(std::clamp<int64_t>(*parsed, 0, 255));
+}
+
+static std::string ReadSurfaceId(FlValue* map) {
+  FlValue* v = fl_value_lookup_string(map, "surfaceId");
+  if (v == nullptr) {
+    return "default";
+  }
+  if (fl_value_get_type(v) == FL_VALUE_TYPE_STRING) {
+    const gchar* s = fl_value_get_string(v);
+    if (s != nullptr && s[0] != '\0') {
+      return std::string(s);
+    }
+  }
+  auto parsed = ToInt64(v);
+  if (parsed.has_value()) {
+    return std::to_string(*parsed);
+  }
+  return "default";
+}
+
+// wgpu changes texture units, UBOs, blend/stencil state and pixel-store state.
+// A partial GL snapshot cannot protect Flutter/MDK's state caches. Keep Dfm
+// in a separate GDK context that shares texture storage with the Flutter view.
+class ScopedGlContext {
+ public:
+  explicit ScopedGlContext(GdkGLContext* context)
+      : previous_(gdk_gl_context_get_current()) {
+    if (previous_) g_object_ref(previous_);
+    gdk_gl_context_make_current(context);
+  }
+  ~ScopedGlContext() {
+    if (previous_) {
+      gdk_gl_context_make_current(previous_);
+      g_object_unref(previous_);
+    } else {
+      gdk_gl_context_clear_current();
+    }
+  }
+ private:
+  GdkGLContext* previous_;
+};
+
+static const void* dfm_gl_proc_loader(const char* name) {
+  if (name == nullptr) {
+    return nullptr;
+  }
+  return reinterpret_cast<const void*>(eglGetProcAddress(name));
+}
+
+static bool EnsureTextureStorage(DfmGLTexture* self,
+                                 uint32_t width,
+                                 uint32_t height) {
+  if (self->texture_name == 0) {
+    glGenTextures(1, &self->texture_name);
+  }
+  if (self->texture_name == 0) {
+    return false;
+  }
+
+  glBindTexture(GL_TEXTURE_2D, self->texture_name);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  const bool resized = self->texture_width != width || self->texture_height != height;
+  if (resized) {
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width),
+                 static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 nullptr);
+    self->texture_width = width;
+    self->texture_height = height;
+  }
+  return true;
+}
+
+static void ClearTexture(GLuint texture_name, uint32_t width, uint32_t height) {
+  if (texture_name == 0 || width == 0 || height == 0) {
+    return;
+  }
+
+  GLuint framebuffer = 0;
+  glGenFramebuffers(1, &framebuffer);
+  if (framebuffer == 0) {
+    return;
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                         texture_name, 0);
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+    glViewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+  }
+  glDeleteFramebuffers(1, &framebuffer);
+}
+
+static gboolean dfm_gl_texture_populate(FlTextureGL* texture,
+                                          uint32_t* target,
+                                          uint32_t* name,
+                                          uint32_t* width,
+                                          uint32_t* height,
+                                          GError** error) {
+  (void)error;
+  auto* dfm_texture = reinterpret_cast<DfmGLTexture*>(texture);
+  if (dfm_texture->state == nullptr || dfm_texture->gl_context == nullptr) {
+    return FALSE;
+  }
+  auto state = *dfm_texture->state;
+  std::lock_guard<std::mutex> guard(state->lock);
+  if (state->disposed) {
+    return FALSE;
+  }
+
+  uint64_t engine_handle = 0;
+  uint32_t desired_width = 0;
+  uint32_t desired_height = 0;
+  engine_handle = state->engine_handle;
+  desired_width = state->width;
+  desired_height = state->height;
+
+  if (engine_handle == 0 || desired_width == 0 || desired_height == 0) {
+    return FALSE;
+  }
+
+  ScopedGlContext context(dfm_texture->gl_context);
+  const bool has_storage = EnsureTextureStorage(dfm_texture, desired_width, desired_height);
+  bool rendered = false;
+  if (has_storage) {
+    rendered = dfm_engine_render_gl_texture(engine_handle, dfm_texture->texture_name,
+                                              desired_width, desired_height,
+                                              dfm_gl_proc_loader) != 0;
+    if (!rendered) {
+      ClearTexture(dfm_texture->texture_name, desired_width, desired_height);
+    }
+  }
+  // The shared texture must be complete before Flutter samples it in its own
+  // context. This also covers the transparent clear path after a failed render.
+  glFinish();
+
+  if (!has_storage) {
+    return FALSE;
+  }
+
+  *target = GL_TEXTURE_2D;
+  *name = dfm_texture->texture_name;
+  *width = desired_width;
+  *height = desired_height;
+  return TRUE;
+}
+
+static void dfm_gl_texture_dispose(GObject* object) {
+  auto* self = reinterpret_cast<DfmGLTexture*>(object);
+  if (self->state != nullptr) {
+    auto state = *self->state;
+    std::lock_guard<std::mutex> guard(state->lock);
+    // wgpu's external GL adapter must also be dropped with its context current.
+    if (self->gl_context != nullptr) {
+      ScopedGlContext context(self->gl_context);
+      if (state->engine_handle != 0) dfm_engine_dispose(state->engine_handle);
+      if (self->texture_name != 0) glDeleteTextures(1, &self->texture_name);
+      glFinish();
+    } else if (state->engine_handle != 0) {
+      // No GL context means no renderer has been initialized yet.
+      dfm_engine_dispose(state->engine_handle);
+    }
+    state->engine_handle = 0;
+    self->texture_name = 0;
+    delete self->state;
+    self->state = nullptr;
+  }
+  g_clear_object(&self->gl_context);
+  G_OBJECT_CLASS(dfm_gl_texture_parent_class)->dispose(object);
+}
+
+static void dfm_gl_texture_class_init(DfmGLTextureClass* klass) {
+  FL_TEXTURE_GL_CLASS(klass)->populate = dfm_gl_texture_populate;
+  G_OBJECT_CLASS(klass)->dispose = dfm_gl_texture_dispose;
+}
+
+static void dfm_gl_texture_init(DfmGLTexture* self) {
+  self->state = nullptr;
+  self->gl_context = nullptr;
+  self->texture_name = 0;
+  self->texture_width = 0;
+  self->texture_height = 0;
+}
+
+static FlTextureGL* create_gl_texture(const std::shared_ptr<SurfaceState>& state,
+                                     GdkGLContext* context) {
+  auto* texture = reinterpret_cast<DfmGLTexture*>(
+      g_object_new(dfm_gl_texture_get_type(), nullptr));
+  texture->state = new std::shared_ptr<SurfaceState>(state);
+  texture->gl_context = context;  // Takes ownership.
+  return FL_TEXTURE_GL(texture);
+}
+
+static gboolean tick_cb(gpointer user_data) {
+  DfmPlusNativePlugin* self = DFM_PLUS_NATIVE_PLUGIN(user_data);
+  std::lock_guard<std::mutex> lock(self->surfaces_lock);
+  for (auto& kv : self->surfaces) {
+    SurfaceState* state = kv.second.get();
+    if (state->engine_handle == 0 || state->texture_id < 0) {
+      continue;
+    }
+    if (!dfm_engine_poll_frame_ready(state->engine_handle)) {
+      continue;
+    }
+    fl_texture_registrar_mark_texture_frame_available(
+        self->texture_registrar, state->texture_base);
+  }
+  return TRUE;
+}
+
+static void dispose_surface(DfmPlusNativePlugin* self,
+                            const std::string& surface_id) {
+  std::shared_ptr<SurfaceState> removed;
+  {
+    std::lock_guard<std::mutex> lock(self->surfaces_lock);
+    auto it = self->surfaces.find(surface_id);
+    if (it == self->surfaces.end()) {
+      return;
+    }
+    removed = std::move(it->second);
+    self->surfaces.erase(it);
+  }
+  {
+    std::lock_guard<std::mutex> guard(removed->lock);
+    removed->disposed = true;
+  }
+  if (removed->texture_base) {
+    fl_texture_registrar_unregister_texture(self->texture_registrar,
+                                            removed->texture_base);
+  }
+  if (removed->texture) {
+    g_object_unref(removed->texture);
+  }
+  // Flutter may still hold a texture reference. Its final dispose releases the
+  // engine in the correct GL context and keeps SurfaceState alive until then.
+}
+
+static void handle_method_call(DfmPlusNativePlugin* self,
+                               FlMethodCall* method_call) {
+  FlValue* args = fl_method_call_get_args(method_call);
+  if (fl_value_get_type(args) != FL_VALUE_TYPE_MAP) {
+    g_autoptr(FlMethodResponse) response = FL_METHOD_RESPONSE(
+        fl_method_error_response_new("invalid_arguments", "Arguments must be map", nullptr));
+    fl_method_call_respond(method_call, response, nullptr);
+    return;
+  }
+
+  const gchar* method = fl_method_call_get_name(method_call);
+  if (g_strcmp0(method, "getTextureInfo") == 0) {
+    const std::string surface_id = ReadSurfaceId(args);
+    const uint32_t width = static_cast<uint32_t>(
+        ReadClampedInt(args, "width", kFallbackSize, 1, kMaxDimension));
+    const uint32_t height = static_cast<uint32_t>(
+        ReadClampedInt(args, "height", kFallbackSize, 1, kMaxDimension));
+
+    std::lock_guard<std::mutex> lock(self->surfaces_lock);
+    auto it = self->surfaces.find(surface_id);
+    bool is_new_engine = false;
+    if (it == self->surfaces.end()) {
+      auto created = std::make_shared<SurfaceState>();
+      created->surface_id = surface_id;
+      created->width = width;
+      created->height = height;
+      created->engine_handle = dfm_engine_create(width, height);
+      if (created->engine_handle == 0) {
+        g_autoptr(FlMethodResponse) response = FL_METHOD_RESPONSE(
+            fl_method_error_response_new("engine_create_failed",
+                                         "dfm_engine_create returned 0", nullptr));
+        fl_method_call_respond(method_call, response, nullptr);
+        return;
+      }
+      FlView* view = fl_plugin_registrar_get_view(self->registrar);
+      GdkWindow* window = view ? gtk_widget_get_window(GTK_WIDGET(view)) : nullptr;
+      g_autoptr(GError) context_error = nullptr;
+      GdkGLContext* context = window
+          ? gdk_window_create_gl_context(window, &context_error) : nullptr;
+      if (context == nullptr || !gdk_gl_context_realize(context, &context_error)) {
+        g_clear_object(&context);
+        dfm_engine_dispose(created->engine_handle);
+        g_autoptr(FlMethodResponse) response = FL_METHOD_RESPONSE(
+            fl_method_error_response_new("gl_context_failed",
+                context_error ? context_error->message : "No Flutter GL window", nullptr));
+        fl_method_call_respond(method_call, response, nullptr);
+        return;
+      }
+      created->texture = create_gl_texture(created, context);
+      created->texture_base = FL_TEXTURE(created->texture);
+      if (!fl_texture_registrar_register_texture(self->texture_registrar,
+                                                 created->texture_base)) {
+        g_object_unref(created->texture);
+        g_autoptr(FlMethodResponse) response = FL_METHOD_RESPONSE(
+            fl_method_error_response_new("register_texture_failed",
+                                         "Failed to register texture", nullptr));
+        fl_method_call_respond(method_call, response, nullptr);
+        return;
+      }
+      created->texture_id = fl_texture_get_id(created->texture_base);
+      is_new_engine = true;
+      it = self->surfaces.emplace(surface_id, std::move(created)).first;
+    }
+    SurfaceState* state = it->second.get();
+    if (state->width != width || state->height != height) {
+      const uint8_t ok = dfm_engine_resize(state->engine_handle, width, height);
+      if (ok == 0) {
+        g_autoptr(FlMethodResponse) response = FL_METHOD_RESPONSE(
+            fl_method_error_response_new("engine_resize_failed",
+                                         "Dfm resize failed", nullptr));
+        fl_method_call_respond(method_call, response, nullptr);
+        return;
+      }
+      {
+        std::lock_guard<std::mutex> state_guard(state->lock);
+        state->width = width;
+        state->height = height;
+      }
+      is_new_engine = true;
+    }
+
+    uint32_t response_width = 0;
+    uint32_t response_height = 0;
+    {
+      std::lock_guard<std::mutex> state_guard(state->lock);
+      response_width = state->width;
+      response_height = state->height;
+    }
+
+    FlValue* response_map = fl_value_new_map();
+    fl_value_set_string_take(response_map, "textureId",
+                             fl_value_new_int(state->texture_id));
+    fl_value_set_string_take(response_map, "engineHandle",
+                             fl_value_new_int(static_cast<int64_t>(state->engine_handle)));
+    fl_value_set_string_take(response_map, "width",
+                             fl_value_new_int(static_cast<int32_t>(response_width)));
+    fl_value_set_string_take(response_map, "height",
+                             fl_value_new_int(static_cast<int32_t>(response_height)));
+    fl_value_set_string_take(response_map, "isNewEngine",
+                             fl_value_new_bool(is_new_engine));
+    g_autoptr(FlMethodResponse) response =
+        FL_METHOD_RESPONSE(fl_method_success_response_new(response_map));
+    fl_method_call_respond(method_call, response, nullptr);
+    return;
+  }
+
+  if (g_strcmp0(method, "setFrame") == 0) {
+    const uint64_t handle = ReadU64(args, "engineHandle", 0);
+    FlValue* frame_json_v = fl_value_lookup_string(args, "frameJson");
+    if (handle == 0 || fl_value_get_type(frame_json_v) != FL_VALUE_TYPE_STRING) {
+      g_autoptr(FlMethodResponse) response = FL_METHOD_RESPONSE(
+          fl_method_error_response_new("invalid_arguments",
+                                       "Missing engineHandle/frameJson", nullptr));
+      fl_method_call_respond(method_call, response, nullptr);
+      return;
+    }
+    const char* frame_json = fl_value_get_string(frame_json_v);
+    const float font_size = ReadFloat(args, "fontSize", 24.0f);
+    const float outline_width = ReadFloat(args, "outlineWidth", 1.0f);
+    const uint8_t shadow_style = ReadU8(args, "shadowStyle", 1);
+    const float opacity = ReadFloat(args, "opacity", 1.0f);
+    FlValue* custom_font_family_v = fl_value_lookup_string(args, "customFontFamily");
+    FlValue* custom_font_file_path_v = fl_value_lookup_string(args, "customFontFilePath");
+    const char* custom_font_family =
+        custom_font_family_v != nullptr && fl_value_get_type(custom_font_family_v) == FL_VALUE_TYPE_STRING
+            ? fl_value_get_string(custom_font_family_v)
+            : "";
+    const char* custom_font_file_path =
+        custom_font_file_path_v != nullptr && fl_value_get_type(custom_font_file_path_v) == FL_VALUE_TYPE_STRING
+            ? fl_value_get_string(custom_font_file_path_v)
+            : "";
+    const uint8_t ok = dfm_engine_set_frame(handle, frame_json, font_size,
+                                              outline_width, shadow_style, opacity,
+                                              custom_font_family, custom_font_file_path);
+    g_autoptr(FlMethodResponse) response = FL_METHOD_RESPONSE(
+        fl_method_success_response_new(fl_value_new_bool(ok != 0)));
+    fl_method_call_respond(method_call, response, nullptr);
+    return;
+  }
+
+  if (g_strcmp0(method, "resetScene") == 0) {
+    const uint64_t handle = ReadU64(args, "engineHandle", 0);
+    const uint8_t ok = dfm_engine_reset_scene(handle);
+    g_autoptr(FlMethodResponse) response = FL_METHOD_RESPONSE(
+        fl_method_success_response_new(fl_value_new_bool(ok != 0)));
+    fl_method_call_respond(method_call, response, nullptr);
+    return;
+  }
+
+  if (g_strcmp0(method, "disposeTexture") == 0) {
+    dispose_surface(self, ReadSurfaceId(args));
+    g_autoptr(FlMethodResponse) response =
+        FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_null()));
+    fl_method_call_respond(method_call, response, nullptr);
+    return;
+  }
+
+  g_autoptr(FlMethodResponse) response =
+      FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
+  fl_method_call_respond(method_call, response, nullptr);
+}
+
+static void method_call_cb(FlMethodChannel* channel,
+                           FlMethodCall* method_call,
+                           gpointer user_data) {
+  DfmPlusNativePlugin* self = DFM_PLUS_NATIVE_PLUGIN(user_data);
+  handle_method_call(self, method_call);
+}
+
+static void dfm_plus_native_plugin_dispose(GObject* object) {
+  DfmPlusNativePlugin* self = DFM_PLUS_NATIVE_PLUGIN(object);
+  if (self->tick_source != 0) {
+    g_source_remove(self->tick_source);
+    self->tick_source = 0;
+  }
+  std::vector<std::string> ids;
+  {
+    std::lock_guard<std::mutex> lock(self->surfaces_lock);
+    ids.reserve(self->surfaces.size());
+    for (const auto& kv : self->surfaces) {
+      ids.push_back(kv.first);
+    }
+  }
+  for (const auto& id : ids) {
+    dispose_surface(self, id);
+  }
+
+  G_OBJECT_CLASS(dfm_plus_native_plugin_parent_class)->dispose(object);
+}
+
+static void dfm_plus_native_plugin_finalize(GObject* object) {
+  DfmPlusNativePlugin* self = DFM_PLUS_NATIVE_PLUGIN(object);
+  self->surfaces.~SurfaceMap();
+  self->surfaces_lock.~SurfaceMutex();
+  G_OBJECT_CLASS(dfm_plus_native_plugin_parent_class)->finalize(object);
+}
+
+static void dfm_plus_native_plugin_class_init(DfmPlusNativePluginClass* klass) {
+  G_OBJECT_CLASS(klass)->dispose = dfm_plus_native_plugin_dispose;
+  G_OBJECT_CLASS(klass)->finalize = dfm_plus_native_plugin_finalize;
+}
+
+static void dfm_plus_native_plugin_init(DfmPlusNativePlugin* self) {
+  new (&self->surfaces) SurfaceMap();
+  new (&self->surfaces_lock) SurfaceMutex();
+  self->channel = nullptr;
+  self->registrar = nullptr;
+  self->texture_registrar = nullptr;
+  self->tick_source = 0;
+}
+
+void dfm_plus_native_plugin_register_with_registrar(FlPluginRegistrar* registrar) {
+  DfmPlusNativePlugin* self = DFM_PLUS_NATIVE_PLUGIN(
+      g_object_new(dfm_plus_native_plugin_get_type(), nullptr));
+  self->registrar = registrar;
+  self->texture_registrar = fl_plugin_registrar_get_texture_registrar(registrar);
+
+  g_autoptr(FlMethodCodec) codec =
+      FL_METHOD_CODEC(fl_standard_method_codec_new());
+  self->channel = fl_method_channel_new(
+      fl_plugin_registrar_get_messenger(registrar), kChannelName, codec);
+  fl_method_channel_set_method_call_handler(self->channel, method_call_cb, self,
+                                            g_object_unref);
+
+  self->tick_source = g_timeout_add(16, tick_cb, self);
+}
